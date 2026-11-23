@@ -30,8 +30,17 @@ Conventions applied to the gold spec (each one is listed in the report):
   * gold definitions (spec fns, gold-only structs, ...) are copied into a module `gold_defs`, and
     gold contracts refer to them there, so they never mix with the verified crate's definitions of
     the same name; `closed` becomes `open`, since the comparison needs their bodies;
+  * a copied gold definition keeps the meaning of the names it took from its own module: that
+    module's items, and what the module imports from the crate, become absolute paths;
   * gold spec methods of an inherent impl (`impl T { spec fn m }`) are renamed `gold_m`, since a
-    type's methods share one namespace;
+    type's methods share one namespace, unless the verified crate defines `T::m` identically
+    (mode, signature and body): then gold contracts mean the crate's `m`, as for same-named
+    types and traits;
+  * when a copied gold definition (an inherent spec method or a view) reads private fields of a
+    verified type, those fields are `pub(crate)` in the scratch copy of the verified crate;
+  * external specifications (`external_trait_specification`, `external_type_specification`,
+    `external_fn_specification`, `assume_specification`), in either spec, specify items outside
+    the crate: they are neither compared nor copied;
   * gold `View` impls become a `GoldView` trait (`x@` -> `x.gv()`);
   * with --invariant NAME, `x@.valid()` on NAME's argument type is read as the gold function NAME;
   * the gold spec's `broadcast axiom`s are in force;
@@ -83,7 +92,7 @@ TOKEN_RE = re.compile(r'''
   | (?P<lifetime>'[A-Za-z_]\w*)
   | (?P<num>\d[\w]*(?:\.\d[\w]*)?(?:[eE][+-]?\d+)?)
   | (?P<ident>r\#[A-Za-z_]\w*|[A-Za-z_]\w*)
-  | (?P<punct><==>|==>|<==|=~~=|=~=|&&&|\|\|\||::|->|=>|==|!=|<=|>=|&&|\|\||\+=|-=|\*=|/=|%=|\^=|&=|\|=|\.\.=|\.\.\.|\.\.|[^\s])
+  | (?P<punct><==>|==>|<==|=~~=|=~=|===|!==|&&&|\|\|\||::|->|=>|==|!=|<=|>=|&&|\|\||\+=|-=|\*=|/=|%=|\^=|&=|\|=|\.\.=|\.\.\.|\.\.|[^\s])
 ''', re.VERBOSE | re.DOTALL)
 IDENT_RE = re.compile(r'[A-Za-z_]\w*$')
 
@@ -171,13 +180,27 @@ def line_indent(src, offset):
     return len(src[start:offset]) - len(src[start:offset].lstrip(' ')), src[start:offset].strip() == ''
 
 
+def strs(toks):
+    """Token strings of Toks, with two `<` (or two `>`) that touch in the source glued back into
+    `<<` (`>>`). The tokenizer keeps them apart, for generics; glued, they also read as shifts,
+    and Rust splits them again in generics."""
+    out = []
+    for k, t in enumerate(toks):
+        if out and t.t in ('<', '>') and out[-1] == t.t and toks[k - 1].e == t.s:
+            out[-1] += t.t
+        else:
+            out.append(t.t)
+    return out
+
+
 def retok(s):
-    return [t.t for t in tokenize(s)]
+    return strs(tokenize(s))
 
 # ------------------------------------------------------------------------------- items
 
 ITEM_KINDS = {'fn', 'struct', 'enum', 'union', 'trait', 'impl', 'mod', 'use', 'type', 'const',
-              'static', 'extern', 'macro_rules', 'broadcast_use', 'broadcast_group'}
+              'static', 'extern', 'macro_rules', 'broadcast_use', 'broadcast_group',
+              'assume_specification'}
 MODIFIERS = {'pub', 'const', 'unsafe', 'async', 'open', 'closed', 'spec', 'proof', 'exec',
              'uninterp', 'broadcast', 'axiom', 'tracked', 'ghost', 'default'}
 SPEC_MODS = {'spec', 'proof', 'uninterp', 'axiom', 'open', 'closed'}
@@ -294,6 +317,20 @@ def parse_items(src, toks, lo, hi):
     return items
 
 
+def vis_of(toks, i):
+    """Visibility of an item whose `pub` (if any) is toks[i]: `pub`, `pub(crate)`, `pub(super)`,
+    `pub(incrate)` (tokens joined), or '' (private)."""
+    if i is None or toks[i].t != 'pub':
+        return ''
+    if toks[i + 1].t == '(':
+        return ''.join(t.t for t in toks[i:match_close(toks, i + 1) + 1])
+    return 'pub'
+
+
+# items that specify something outside the crate (std, ...): they are neither compared nor copied
+EXTERNAL_SPEC = re.compile(r'verifier\s*::\s*external_(?:trait|type|fn)_specification')
+
+
 def attr_spans(toks, a, b):
     """The `#[..]` / `#![..]` attributes in toks[a:b], as (start, end) index pairs."""
     spans, i = [], a
@@ -357,9 +394,14 @@ def cfg_holds(toks, spans, features):
 # --------------------------------------------------------------------------- signatures
 
 
+# tokens after which a `|` opens the parameters of a closure or quantifier (else it is a bitwise or)
+BINDER_BEFORE = {None, 'forall', 'exists', 'choose', 'move', '(', '[', '{', ',', '=', '!', '=>', '==>',
+                 '<==', '<==>', '&&', '||', '&&&', '|||', 'return', ':'}
+
+
 def split_top(toks, lo, hi, angle=False):
     """Split toks[lo:hi] at top-level commas (not inside brackets, generics or `|..|` binders)."""
-    parts, cur, depth, adepth, binder = [], [], 0, 0, False
+    parts, cur, depth, adepth, binder, prev = [], [], 0, 0, False, None
     for t in toks[lo:hi]:
         s = t.t
         if s in OPEN:
@@ -370,8 +412,9 @@ def split_top(toks, lo, hi, angle=False):
             adepth += 1
         elif angle and s == '>':
             adepth -= 1
-        elif s == '|' and depth == 0:
-            binder = not binder
+        elif s == '|' and depth == 0 and (binder or prev in BINDER_BEFORE):
+            binder = not binder  # `|x, y|` of a closure or quantifier (not a bitwise `|`)
+        prev = s
         if s == ',' and depth == 0 and adepth == 0 and not binder:
             parts.append(cur)
             cur = []
@@ -399,10 +442,11 @@ def parse_sig(src, toks, item):
         k = e + 1
     pe = match_close(toks, k)
     params = split_top(toks, k + 1, pe, angle=True)
-    sg.receiver, sg.params = None, []
+    sg.receiver, sg.recv_lt, sg.params = None, '', []
     for p in params:
         ts = [t.t for t in p]
         if 'self' in ts and ':' not in ts:
+            sg.recv_lt = ts[1] if len(ts) > 1 and ts[0] == '&' and ts[1].startswith("'") else ''
             sg.receiver = '&mut' if ts[:2] == ['&', 'mut'] or (len(ts) > 2 and ts[0] == '&' and ts[2] == 'mut') \
                 else '&' if ts[0] == '&' else 'self'
             continue
@@ -465,6 +509,13 @@ def impl_parts(src, toks, item):
     if f is None:
         return gen, None, text_of(src, toks, k, w - 1)
     return gen, text_of(src, toks, k, f - 1), text_of(src, toks, f + 1, w - 1)
+
+
+def impl_where(src, toks, item):
+    """The `where` clause of an impl item's header (without `where`), or ''."""
+    head_end = item.body[0]
+    w = next((j for j in range(item.kw + 1, head_end) if toks[j].t == 'where'), None)
+    return text_of(src, toks, w + 1, head_end - 1).rstrip(',') if w is not None and w + 1 < head_end else ''
 
 
 def core_type(ty):
@@ -573,6 +624,7 @@ class Source:
         self.traits = {}                          # trait name -> record
         self.defs = []                            # spec-level items (copied for the gold side)
         self.inherent_spec = set()                # (type, method) of spec methods of inherent impls
+        self.inherent_bodies = {}                 # (type, method) -> mode, signature and body tokens
         self.views, self.model_fields = {}, {}
         self.mod_items = collections.defaultdict(set)
         self.imports = collections.defaultdict(list)
@@ -580,6 +632,8 @@ class Source:
         self.trusted_types = set()
         self.uninterp, self.axioms, self.axiom_covered = set(), [], set()
         self.external_mods, self.warnings, self.macros = set(), [], {}
+        self.mod_vis, self.item_vis = {}, {}      # module path -> visibility; (module path, name) -> visibility
+        self.external_specs = []                  # external specifications (neither compared nor copied)
         files = crate_files(root)
         docs = []
         for mp, (rel, text) in sorted(files.items(), key=lambda kv: (len(kv[0]), kv[0])):
@@ -637,6 +691,8 @@ class Source:
                     j = match_close(toks, j) + 1
             kw = toks[j].t
             ok = self.cfg_ok(doc, a0, i)
+            if kw == 'mod' and ok:
+                self.mod_vis[mp + (toks[j + 1].t,)] = vis_of(toks, i)
             if kw == 'mod' and toks[j + 2].t == '{':
                 c = match_close(toks, j + 2)
                 if ok:
@@ -690,9 +746,10 @@ class Source:
         if it.kind in ('struct', 'enum', 'union'):
             self.trusted_types.add(toks[it.kw + 1].t)
             self.structs.add(toks[it.kw + 1].t)
-        if it.kind not in ('impl', 'use', 'macro_call', 'macro_rules', 'broadcast_use'):
+        if it.kind not in ('impl', 'use', 'macro_call', 'macro_rules', 'broadcast_use', 'assume_specification'):
             self.names.add(toks[it.kw + 1].t)
             self.mod_items[mp].add(toks[it.kw + 1].t)
+            self.item_vis[(mp, toks[it.kw + 1].t)] = vis_of(toks, it.vis)
         if it.kind == 'fn':
             self.trusted.add(('', '', toks[it.kw + 1].t))
         if it.kind == 'impl':
@@ -745,13 +802,18 @@ class Source:
         if kind == 'use':
             self.imports[mp].append((doc, it.kw, it.end))
             return
+        if kind == 'assume_specification' or EXTERNAL_SPEC.search(doc.text[toks[it.start].s:toks[it.kw].s]):
+            self.external_specs.append(' '.join(doc.text[toks[it.kw].s:toks[it.end].e].split())[:80])
+            return
         if kind in ('impl', 'broadcast_use', 'macro_rules'):
             name = None
         else:
             name = toks[it.kw + 1 + (kind == 'broadcast_group')].t
             self.names.add(name)
             self.mod_items[mp].add(name)
+            self.item_vis[(mp, name)] = vis_of(toks, it.vis)
         if kind == 'mod':
+            self.mod_vis[mp + (name,)] = vis_of(toks, it.vis)
             if it.body:
                 self.collect(doc, it.body[0] + 1, it.body[1], mp + (name,), ext, depth)
             return
@@ -766,7 +828,7 @@ class Source:
                             self.axiom_covered.add(toks[j + 4].t)
                 self.defs.append(Item(doc=doc, it=it, mp=mp, kind='fn'))
             else:
-                self.add_fn(doc, it, mp, ext, None, None, '')
+                self.add_fn(doc, it, mp, ext, None, None, '', '')
             return
         if kind in ('struct', 'enum', 'union'):
             self.structs.add(name)
@@ -779,7 +841,7 @@ class Source:
             self.defs.append(Item(doc=doc, it=it, mp=mp, kind=kind))
             return
         if kind == 'trait':
-            rec = Item(name=name, mp=mp, doc=doc, it=it, assoc=set(), methods={})
+            rec = Item(name=name, mp=mp, doc=doc, it=it, assoc=set(), methods={}, vis=vis_of(toks, it.vis))
             for m in it.members:
                 if m.kind in ('type', 'const', 'fn'):
                     rec.assoc.add(toks[m.kw + 1].t)
@@ -799,16 +861,19 @@ class Source:
             if not trait and spec_members:
                 for m in spec_members:
                     self.inherent_spec.add((core_type(self_ty)[1], toks[m.kw + 1].t))
+                    self.inherent_bodies[(core_type(self_ty)[1], toks[m.kw + 1].t)] = tuple(
+                        [x for x in m.mods if x in ('spec', 'proof')] + strs(toks[m.kw:m.end + 1]))
                 self.defs.append(Item(doc=doc, it=it, mp=mp, kind='inherent', members=spec_members,
                                       self_ty=self_ty, gen=gen))
+            where = impl_where(doc.text, toks, it)
             for m in it.members:
                 if m.kind == 'fn' and not set(m.mods) & SPEC_MODS and self.cfg_ok(doc, m.start, m.kw):
-                    self.add_fn(doc, m, mp, ext, self_ty, trait, gen)
+                    self.add_fn(doc, m, mp, ext, self_ty, trait, gen, where)
             return
         if kind in ('const', 'static', 'type', 'broadcast_group'):
             self.defs.append(Item(doc=doc, it=it, mp=mp, kind=kind))
 
-    def add_fn(self, doc, m, mp, ext, self_ty, trait, gen):
+    def add_fn(self, doc, m, mp, ext, self_ty, trait, gen, impl_where_):
         sig = parse_sig(doc.text, doc.toks, m)
         key = fn_key(self_ty, trait, sig.name) if self_ty else ('', '', sig.name)
         if ext:
@@ -816,7 +881,7 @@ class Source:
             return
         attrs = doc.text[doc.toks[m.start].s:doc.toks[m.kw].s]
         self.fns[key].append(Item(key=key, doc=doc, it=m, sig=sig, mp=mp, self_ty=self_ty, trait=trait,
-                                  gen=gen, unsafe='unsafe' in m.mods,
+                                  gen=gen, impl_where=impl_where_, unsafe='unsafe' in m.mods,
                                   external_body=bool(re.search(r'verifier\s*::\s*external_body', attrs))))
 
     def finish(self):
@@ -837,6 +902,27 @@ class Source:
                 self.model_fields[name] = [st_toks[k].t for k in range(lo + 1, hi)
                                            if st_toks[k + 1].t == ':' and st_toks[k - 1].t in ('{', ',', 'pub', ')')]
 
+    def visible_at_root(self, mp, name=None):
+        """Whether the module `crate::<mp>` (and, given `name`, its item `name`) can be named from a
+        module at the crate root, such as the generated `gold_check`. Unknown visibility (an item
+        that a macro or a re-export provides) counts as visible."""
+        def ok(vis, decl_mp):  # an item declared in module `decl_mp`
+            return (not decl_mp or vis in ('pub', 'pub(crate)', 'pub(incrate)')
+                    or (vis == 'pub(super)' and len(decl_mp) == 1))
+        for i in range(1, len(mp)):
+            v = self.mod_vis.get(mp[:i + 1])
+            if v is not None and not ok(v, mp[:i]):
+                return False
+        v = self.item_vis.get((mp, name)) if name is not None else None
+        return v is None or ok(v, mp)
+
+    def path_visible(self, segs):
+        """`visible_at_root` for an absolute path (`crate`, then module and item names)."""
+        segs = tuple(segs[1:]) if segs and segs[0] == 'crate' else tuple(segs)
+        if not segs or segs in self.mod_vis:
+            return self.visible_at_root(segs)
+        return self.visible_at_root(segs[:-1], segs[-1])
+
     def trait_path(self, name):
         rec = self.traits.get(name)
         return '::'.join(('crate',) + rec.mp + (name,)) if rec else None
@@ -851,16 +937,16 @@ class Source:
         orig = lambda doc, c: ' '.join(doc.text[c[0].s:c[-1].e].split())
         if tdecl:
             ren = {a: b for (a, _), (b, _) in zip(tdecl.sig.params, rec.sig.params) if a != b}
-            if tdecl.sig.ret_name and rec.sig.ret_name and tdecl.sig.ret_name != rec.sig.ret_name:
-                ren[tdecl.sig.ret_name] = rec.sig.ret_name
+            if tdecl.sig.ret_name and tdecl.sig.ret_name != (rec.sig.ret_name or 'ret'):
+                ren[tdecl.sig.ret_name] = rec.sig.ret_name or 'ret'  # (`side_sig` names it `ret`)
             for c in tdecl.sig.clauses.get('requires', []):
-                req.append(([t.t for t in c], orig(tdecl.doc, c), tdecl.mp, ren))
+                req.append((strs(c), orig(tdecl.doc, c), tdecl.mp, ren))
             for c in tdecl.sig.clauses.get('ensures', []):
-                ens.append(([t.t for t in c], orig(tdecl.doc, c), tdecl.mp, ren))
+                ens.append((strs(c), orig(tdecl.doc, c), tdecl.mp, ren))
         for c in rec.sig.clauses.get('requires', []):
-            req.append(([t.t for t in c], orig(rec.doc, c), rec.mp, {}))
+            req.append((strs(c), orig(rec.doc, c), rec.mp, {}))
         for c in rec.sig.clauses.get('ensures', []):
-            ens.append(([t.t for t in c], orig(rec.doc, c), rec.mp, {}))
+            ens.append((strs(c), orig(rec.doc, c), rec.mp, {}))
         return req, ens
 
 # ---------------------------------------------------------------------------- imports
@@ -912,7 +998,8 @@ def flatten_use(doc, a, b, mp, mod_items):
             path = ['crate', *mp, *path]
         p = '::'.join(path)
         name = alias or ('*' if glob else path[-1])
-        lines.append((name, f'use {p}::*;' if glob else (f'use {p} as {alias};' if alias else f'use {p};'), path[0]))
+        lines.append((name, f'use {p}::*;' if glob else (f'use {p} as {alias};' if alias else f'use {p};'),
+                      path[0], path))
     return lines
 
 
@@ -921,9 +1008,11 @@ def import_block(src, mps, local_only=False):
     seen, out = set(), []
     for mp in mps:
         for doc, a, b in src.imports.get(mp, []):
-            for name, line, root in flatten_use(doc, a, b, mp, src.mod_items):
+            for name, line, root, path in flatten_use(doc, a, b, mp, src.mod_items):
                 if local_only and root in ('crate', 'self', 'super'):
                     continue
+                if root == 'crate' and not src.path_visible(path):
+                    continue  # private to its module: the generated module cannot import it
                 key = line if name == '*' else name
                 if key not in seen:
                     seen.add(key)
@@ -973,7 +1062,7 @@ def expr_type(ts, a, b, env, field_types):
 
 def expr_after(ts, i):
     """End index (exclusive) of the operand of a binary `==` that starts at ts[i]."""
-    stop = {',', ';', '&&', '||', '&&&', '|||', '==>', '<==>', '<==', '=>', '==', '!='}
+    stop = {',', ';', '&&', '||', '&&&', '|||', '==>', '<==>', '<==', '=>', '==', '!=', '===', '!=='}
     depth, j = 0, i
     while j < len(ts):
         t = ts[j]
@@ -1080,7 +1169,7 @@ def rewrite_contract(ts, cx, env, renames, nocap=False):
     # gets Verus's automatic extensional equality); the capacity-free variant drops `capacity`.
     k = 0
     while k < len(ts):
-        if ts[k] == '==' and k > 0 and ts[k - 1] == '@':
+        if ts[k] in ('==', '===') and k > 0 and ts[k - 1] == '@':
             a = expr_before(ts, k - 1)
             ty = expr_type(ts, a, k - 1, env, field_types)
             if ty in gold.model_fields and ty not in gold.placeholder_types:
@@ -1157,14 +1246,33 @@ def rewrite_def_text(d, cx, gold):
             for j in range(item.body[0], item.end):
                 if toks[j].t == 'view' and toks[j - 1].t == 'fn':
                     edits.append((j, j, 'gv'))
-        else:  # an inherent impl: only its spec methods, renamed
+        else:  # an inherent impl: only its spec methods, renamed (those the crate has too: dropped)
             for m in item.members:
                 if m.kind == 'fn' and set(m.mods) & SPEC_MODS:
-                    edits.append((m.kw + 1, m.kw + 1, 'gold_' + toks[m.kw + 1].t))
+                    if (impl_self, toks[m.kw + 1].t) in getattr(gold, 'same_methods', ()):
+                        edits.append((m.start, m.end, ''))
+                    else:
+                        edits.append((m.kw + 1, m.kw + 1, 'gold_' + toks[m.kw + 1].t))
             for m in item.members:
                 if not (m.kind == 'fn' and set(m.mods) & SPEC_MODS):
                     edits.append((m.start, m.end, ''))
     names = [t.t for t in toks]
+    # A gold definition moves to `gold_defs`: the names it took from its own module (that module's
+    # items, and what the module imports from the crate) become absolute paths, as `rewrite` does
+    # for contract clauses. Names it declares itself (parameters, fields, binders) stay.
+    scope = {n: ('crate',) + d.mp + (n,) for n in gold.mod_items.get(d.mp, ()) if n not in gold.copied}
+    for doc, a, b in gold.imports.get(d.mp, []):
+        for n, _, root, path in flatten_use(doc, a, b, d.mp, gold.mod_items):
+            if root == 'crate' and n != '*' and n not in gold.copied:
+                scope[n] = tuple(path)
+    declared = binders(names[item.start:item.end + 1]) | {
+        names[j] for j in range(item.start, item.end) if names[j + 1] == ':'}
+    decl_kws = {'fn', 'struct', 'enum', 'union', 'trait', 'type', 'const', 'static', 'mod', 'let'}
+    for j in range(item.start, item.end + 1):
+        t = names[j]
+        if (t in scope and t not in declared and names[j - 1] not in {'.', '::'} | decl_kws
+                and (j + 1 > item.end or names[j + 1] not in ('!', ':'))):
+            edits.append((j, j, '::'.join(scope[t])))
     for j in range(item.start, item.end + 1):
         env = {}
         for s, e, en in env_by_fn:
@@ -1233,8 +1341,9 @@ def hint_lines(proofs, name, pos):
 
 
 def emit_fn(gen, name, generics, recv, self_ty, params, ret, where, requires, ensures, body,
-            attrs='', axioms=()):
-    recv_param = {'&': f'slf: &{self_ty}', '&mut': f'slf: &mut {self_ty}', 'self': f'slf: {self_ty}',
+            attrs='', axioms=(), recv_lt=''):
+    lt = recv_lt + ' ' if recv_lt else ''
+    recv_param = {'&': f'slf: &{lt}{self_ty}', '&mut': f'slf: &{lt}mut {self_ty}', 'self': f'slf: {self_ty}',
                   None: None}[recv]
     ps = ', '.join([p for p in [recv_param] if p] + [f'{n}: {t}' for n, t in params])
     rt = f' -> ({ret[0]}: {ret[1]})' if ret and ret[0] else (f' -> {ret[1]}' if ret else '')
@@ -1257,13 +1366,22 @@ def emit_fn(gen, name, generics, recv, self_ty, params, ret, where, requires, en
     gen.add('')
 
 
+def maybe_unsized(self_ty, *texts):
+    """Whether the type `self_ty` is a type parameter that the generics or where clauses `texts`
+    bound by `?Sized` (then `*slf` cannot be moved into a ghost variable)."""
+    name = (self_ty or '').strip()
+    return bool(IDENT_RE.match(name)) and any(
+        re.search(r'(?:^|[<,(\s])' + re.escape(name) + r'\s*:[^,;{]*\?\s*Sized', t or '') for t in texts)
+
+
 def side_sig(rec, cx):
     """(generics, params, return, where) of a function record, rewritten for the generated module."""
     ty = lambda s: join(rewrite(retok(s), cx)) if s else s
     params = [(n, ty(t)) for n, t in rec.sig.params]
     ret = (rec.sig.ret_name or 'ret', ty(rec.sig.ret_type)) if rec.sig.ret_type else None
     generics = ', '.join(x for x in (rec.gen, rec.sig.generics) if x)
-    return generics, params, ret, ty(rec.sig.where)
+    where = ', '.join(x for x in (getattr(rec, 'impl_where', ''), rec.sig.where) if x)
+    return generics, params, ret, ty(where)
 
 
 def call_expr(rec, cx, args):
@@ -1316,7 +1434,8 @@ def generate(gold, verified, proofs, invariant, excluded):
     for line in import_block(verified, contract_mps):
         g.add(line)
     for name in sorted(verified.traits):  # every trait's methods, without adding names
-        g.add(f'use {verified.trait_path(name)} as _;')
+        if verified.visible_at_root(verified.traits[name].mp, name):  # (not a trait of a private module)
+            g.add(f'use {verified.trait_path(name)} as _;')
     if gold.copied & verified.names:  # some gold names are the crate's too: always `gold_defs::x`
         g.add('use self::gold_defs::{GoldView' + (', GoldInv' if inv_type else '') + '};')
     else:  # no clash: proofs may also name gold definitions directly
@@ -1403,7 +1522,7 @@ def generate(gold, verified, proofs, invariant, excluded):
             call = proofs['calls'].get(name) or proofs['calls'].get(name.replace('__nocap', '')) \
                 or call_expr(vrec, gcx, args)
             body = []
-            if grec.sig.receiver:
+            if grec.sig.receiver and not maybe_unsized(gcx.self_ty, gen_txt, gwhere):
                 body.append('let ghost pre = ' + ('*slf;' if grec.sig.receiver in ('&', '&mut') else 'slf;'))
             body += hint_lines(proofs, name, 'before')
             body.append(f'let ret = {call};' if gret else f'{call};')
@@ -1411,7 +1530,7 @@ def generate(gold, verified, proofs, invariant, excluded):
             if gret:
                 body.append('ret')
             emit_fn(g, name, gen_txt, grec.sig.receiver, gcx.self_ty, gparams, gret, gwhere, rq, en, body,
-                    axioms=gold.axioms)
+                    axioms=gold.axioms, recv_lt=grec.sig.recv_lt)
             r.wrappers.append((name, nocap))
         # gold => Claude: functions whose verified contract says something
         vreq, vens = verified.contract(vrec)
@@ -1426,7 +1545,7 @@ def generate(gold, verified, proofs, invariant, excluded):
         rq = [(rw(c), c[1]) for c in greq]
         en = [(rw(c), c[1]) for c in gens]
         emit_fn(g, gname, gen_txt, grec.sig.receiver, gcx.self_ty, gparams, gret, gwhere, rq, en,
-                ['unimplemented!()'], attrs='#[verifier::external_body]\n')
+                ['unimplemented!()'], attrs='#[verifier::external_body]\n', recv_lt=grec.sig.recv_lt)
         agen, aparams, aret, awhere = side_sig(vrec, vcx)
         aenv = {'slf': core_type(vcx.self_ty)[1] if vcx.self_ty else None,
                 **{n: core_type(t)[1] for n, t in aparams}}
@@ -1437,7 +1556,7 @@ def generate(gold, verified, proofs, invariant, excluded):
         aargs = ', '.join((['slf'] if vrec.sig.receiver else []) + [n for n, _ in aparams])
         call = proofs['calls'].get(hname) or f'{gname}({aargs})'
         body = []
-        if vrec.sig.receiver:
+        if vrec.sig.receiver and not maybe_unsized(vcx.self_ty, agen, awhere):
             body.append('let ghost pre = ' + ('*slf;' if vrec.sig.receiver in ('&', '&mut') else 'slf;'))
         body += hint_lines(proofs, hname, 'before')
         body.append(f'let ret = {call};' if aret else f'{call};')
@@ -1445,7 +1564,7 @@ def generate(gold, verified, proofs, invariant, excluded):
         if aret:
             body.append('ret')
         emit_fn(g, hname, agen, vrec.sig.receiver, vcx.self_ty, aparams, aret, awhere, arq, aen, body,
-                axioms=gold.axioms)
+                axioms=gold.axioms, recv_lt=vrec.sig.recv_lt)
     g.add('} // verus!')
     return g, results
 
@@ -1464,9 +1583,17 @@ def prepare_gold(gold, verified, proofs):
         gold.uninterp.discard(name)
         gold.interpreted[name] = m.group(0).strip()
     gold.finish()
+    # A gold inherent spec method that the verified type defines too, identically (mode, signature
+    # and body): gold contracts mean the crate's method, as for same-named types and traits. The
+    # other gold inherent spec methods are renamed `gold_..` and copied.
+    gold.same_methods = {k for k, v in gold.inherent_bodies.items() if verified.inherent_bodies.get(k) == v}
+    gold.inherent_spec -= gold.same_methods
     usable, copied = [], set(gold.interpreted)
     for d in gold.defs:
         toks = d.doc.toks
+        if d.kind == 'inherent' and all((core_type(d.self_ty)[1], toks[m.kw + 1].t) in gold.same_methods
+                                        for m in d.members):
+            continue
         if d.kind in ('struct', 'enum', 'union', 'trait', 'const', 'static', 'type'):
             name = toks[d.it.kw + 1].t
             if name in verified.names:
@@ -1578,6 +1705,47 @@ def error_blocks(out):
             if b.startswith('error') and 'aborting due' not in b]
 
 
+def open_fields(gold, verified, crate):
+    """Gold inherent spec methods and views are copied into `gold_defs`, but may read the private
+    fields of the verified type they belong to. In the scratch copy of the verified crate, those
+    types' private fields become `pub(crate)` (visibility only: no contract changes). Returns the
+    names of the types changed."""
+    wanted = set()
+    for d in gold.usable:
+        if d.kind == 'inherent':
+            wanted.add(core_type(d.self_ty)[1])
+        elif d.kind == 'view':
+            wanted.add(core_type(impl_parts(d.doc.text, d.doc.toks, d.it)[2])[1])
+    edits, changed = collections.defaultdict(list), []
+    for d in verified.defs:
+        toks = d.doc.toks
+        if d.kind != 'struct' or toks[d.it.kw + 1].t not in wanted or ': ' in d.doc.label:
+            continue  # (a struct from a macro invocation cannot be edited)
+        if d.it.body:
+            lo, hi = d.it.body
+        else:  # a tuple struct: `struct S<..>(..);`
+            k = d.it.kw + 2
+            if toks[k].t == '<':
+                k = match_angle(toks, k) + 1
+            if toks[k].t != '(':
+                continue
+            lo, hi = k, match_close(toks, k)
+        for f in split_top(toks, lo + 1, hi, angle=True):
+            k = 0
+            while k < len(f) and f[k].t == '#':
+                k = f.index(next(x for x in f[k:] if x.t == ']')) + 1
+            if k < len(f) and f[k].t != 'pub':
+                edits[d.doc.label].append(f[k].s)
+        changed.append(toks[d.it.kw + 1].t)
+    for label, offsets in edits.items():
+        path = os.path.join(crate, label)
+        text = open(path).read()
+        for o in sorted(offsets, reverse=True):
+            text = text[:o] + 'pub(crate) ' + text[o:]
+        open(path, 'w').write(text)
+    return sorted(set(changed))
+
+
 def run(args):
     gold = Source(args.gold, set(args.features))
     verified = Source(args.crate, set(args.features))
@@ -1588,6 +1756,7 @@ def run(args):
     crate = os.path.join(tmp, 'crate')
     shutil.copytree(args.crate, crate, ignore=shutil.ignore_patterns('target', '.verus-solver-log', '.verus-log'))
     open(os.path.join(crate, 'src', 'lib.rs'), 'a').write('\n#[cfg(verus_keep_ghost)]\nmod gold_check;\n')
+    verified.opened = open_fields(gold, verified, crate)
     excluded = {}
     for _ in range(12):  # drop obligations whose generated code does not compile, then retry
         g, results = generate(gold, verified, proofs, args.invariant, excluded)
@@ -1681,10 +1850,18 @@ def report(args, gold, verified, results, failures, compile_errors, notes, proof
              'declaration\'s, for traits the crate defines).',
              '- Conventions: gold definitions are copied into `gold_defs` (`closed` -> `open`; `View` -> '
              '`GoldView`)'
+             + (f'; gold spec methods of inherent impls that the verified crate defines identically are the '
+                f'crate\'s: ' + ', '.join(f'`{t}::{m}`' for t, m in sorted(gold.same_methods))
+                if getattr(gold, 'same_methods', None) else '')
              + (f'; gold spec methods of inherent impls are renamed: '
                 + ', '.join(f'`{t}::{m}` -> `gold_{m}`' for t, m in sorted(gold.inherent_spec)) if gold.inherent_spec else '')
              + (f'; `x@.valid()` is read as `{args.invariant}`' if args.invariant else '')
              + '; gold axioms in force: ' + (', '.join(f'`{a}`' for a in gold.axioms) or 'none')
+             + ('; private fields read by copied gold definitions are `pub(crate)` in the scratch copy of the '
+                'verified crate: ' + ', '.join(f'`{t}`' for t in verified.opened) if getattr(verified, 'opened', None) else '')
+             + (f'; external specifications (of items outside the crate) are neither compared nor copied: '
+                f'{len(gold.external_specs)} in the gold spec, {len(verified.external_specs)} in the verified crate'
+                if gold.external_specs or verified.external_specs else '')
              + f'; cfg: features {sorted(args.features) or "none"}, pointer width {PTR_WIDTH}.',
              '- *capacity only*: the obligation fails, but holds once capacity clauses are removed.',
              '- *does not compile*: the generated obligation does not compile (for example, the two '
