@@ -1,0 +1,6 @@
+target/
+Cargo.lock
+.verus-log/
+.verus-solver-log/
+*.long-type-*.txt
+liblib.rlib

@@ -1,0 +1,36 @@
+[package]
+name = "rand_core"
+version = "0.10.1"
+authors = ["The Rand Project Developers"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/rust-random/rand_core"
+documentation = "https://docs.rs/rand_core"
+homepage = "https://rust-random.github.io/book"
+description = "Core random number generation traits and tools for implementation."
+keywords = ["random", "rng"]
+categories = ["algorithms", "no-std"]
+edition = "2024"
+# Upstream: 1.85. The `vstd` dependency (for the `verus!` macro) needs the toolchain that Verus
+# is built with.
+rust-version = "1.100"
+exclude = ["/.github"]
+publish = false
+
+[dependencies]
+# Only for the normal (non-Verus) build: provides the `verus!` macro, which erases the ghost code
+# (specifications and proofs). Verification uses the `verus` binary with its bundled vstd.
+vstd = { version = "=0.0.0-2026-11-22-0344", default-features = false }
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)', 'cfg(verus_only)'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[package.metadata.docs.rs]
+# To build locally:
+# cargo +nightly doc --open
+rustdoc-args = ["--generate-link-to-definition"]

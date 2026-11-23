@@ -1,0 +1,2620 @@
+# Hand edits in verus_fixed/ relative to verus/ (2026-11-23). The reports (VERIFICATION.md, edited;
+# SPEC_REVIEW.md, new) and this file are left out, as are build outputs.
+
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/src/block.rs verus_fixed/src/block.rs
+--- verus/src/block.rs	2026-11-18 19:22:50.930606775 -0500
++++ verus_fixed/src/block.rs	2026-11-23 06:00:25.845699290 -0500
+@@ -76,9 +76,27 @@
+ 
+ use crate::utils::Word;
+ use vstd::prelude::*;
++// (Verus builds only: the trait of `try_from_spec`, with which the developer's spec states the
++// index. Imports nothing in a normal build, where the ghost code that uses it is erased.)
++#[cfg(verus_keep_ghost)]
++use vstd::std_specs::convert::TryFromSpec;
+ 
+ verus! {
+ 
++// The developer's spec states the index with `W::try_from_spec`; this relates it to the value of
++// the stored word (a module-level `broadcast use`, so that no exec function gains a proof block).
++broadcast use crate::word::lemma_try_from_usize_spec;
++
++/// (ghost) The word `x`, the first word of a `BlockRng`'s output buffer, stores the index `i`.
++/// This is the developer's `W::try_from_spec(i as usize) === Ok(x)`, by definition. The
++/// developer's clauses are stated here with `index_is` so that they can be triggered on the
++/// stored word `x`: triggered on `W::try_from_spec(i as usize)` (the developer's choice), a clause
++/// that concludes `W::try_from_spec((i + 1) as usize) === ...` instantiates itself again, without
++/// end (SPEC_REVIEW.md, H5).
++pub open spec fn index_is<W: Word>(x: W, i: int) -> bool {
++    W::try_from_spec(i as usize) === Ok(x)
++}
++
+ /// A random (block) generator
+ pub trait Generator {
+     /// The output type.
+@@ -146,10 +164,13 @@
+     #[inline]
+     pub fn new(core: G) -> (r: BlockRng<G>)
+         requires
++            // (The developer's precondition, `N > 0` and `W::try_from_spec(N).is_ok()`, is the
++            // same: `W::lemma_try_from_usize`.)
+             0 < N <= W::spec_max(),
+         ensures
+             r.wf(),
+             r.buffer() == Seq::<W>::empty(),
++            // (also the developer's postcondition, `result.spec_core() === core`)
+             r.spec_core() == core,
+     {
+         let mut results = [W::default(); N];
+@@ -165,11 +186,19 @@
+     /// Returns `None` if `remaining_results` is too long.
+     pub fn reconstruct(core: G, remaining_results: &[W]) -> (r: Option<Self>)
+         requires
+-            0 < N <= W::spec_max(),
++            // Human spec. (Upstream panics only when it builds a result: for `N == 0`, or for
++            // `N > W::MAX` with `remaining_results.len() >= N`, it returns `None`.)
++            remaining_results@.len() < N ==> W::try_from_spec(N).is_ok(),
+         ensures
+             remaining_results@.len() < N ==> (r matches Some(rng) && rng.wf() && rng.buffer()
+                 == remaining_results@ && rng.spec_core() == core),
+             remaining_results@.len() >= N ==> r is None,
++            // Human spec
++            (r is None) <==> remaining_results@.len() >= N,
++            match r {
++                Some(rng) => rng.spec_core() === core,
++                None => true,
++            },
+     {
+         let mut results = [W::default(); N];
+         if remaining_results.len() < N {
+@@ -215,6 +244,11 @@
+         self.core
+     }
+ 
++    /// (ghost, from the developer's spec) The output buffer, whose first word holds the index.
++    pub closed spec fn spec_results(&self) -> G::Output {
++        self.results
++    }
++
+     /// (ghost) The words of `blocks`, in order.
+     pub open spec fn blocks_words(blocks: Seq<[W; N]>) -> Seq<W>
+         decreases blocks.len(),
+@@ -253,6 +287,52 @@
+             }
+     }
+ 
++    /// `wf()` in the terms of the developer's spec: `N` is positive and fits in `W`, and the index
++    /// stored in `results[0]` is in `1..=N`. This is the developer's precondition of `next_word`
++    /// and `fill_bytes` (and, with `N >= 2`, of `next_u64_from_u32`).
++    pub proof fn lemma_wf_human(&self)
++        ensures
++            self.wf() <==> {
++                &&& N > 0
++                &&& W::try_from_spec(N).is_ok()
++                &&& exists|i: int|
++                    1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                        self.spec_results()@[0],
++                    )
++            },
++    {
++        W::lemma_word();
++        if N > 0 {
++            let x = self.results@[0];
++            W::lemma_try_from_usize(N, x);
++            if self.wf() {
++                W::lemma_try_from_usize(self.spec_index() as usize, x);
++                assert(W::try_from_spec(self.spec_index() as usize) === Ok(self.spec_results()@[0]));
++            }
++            if exists|i: int|
++                1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                    self.spec_results()@[0],
++                ) {
++                let i = choose|i: int|
++                    1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                        self.spec_results()@[0],
++                    );
++                W::lemma_try_from_usize(i as usize, x);
++            }
++        }
++    }
++
++    /// `index_is(self.spec_results()@[0], i)`, for `i` in `0..=N`: the index is `i`.
++    proof fn lemma_index_is(&self, i: int)
++        requires
++            0 <= i <= N,
++        ensures
++            index_is(self.spec_results()@[0], i) <==> (i <= W::spec_max()
++                && self.spec_index() == i),
++    {
++        W::lemma_try_from_usize(i as usize, self.results@[0]);
++    }
++
+     /// Get the index into the result buffer.
+     ///
+     /// If this is equal to or larger than the size of the result buffer then
+@@ -261,7 +341,8 @@
+     #[inline(always)]
+     fn index(&self) -> (r: usize)
+         requires
+-            self.wf(),
++            0 < N,
++            self.spec_index() <= N,
+         ensures
+             r == self.spec_index(),
+     {
+@@ -294,7 +375,9 @@
+     #[inline]
+     pub fn reset_and_skip(&mut self, n: usize)
+         requires
+-            old(self).wf(),
++            // Human spec (the method never reads the old index, so it needs no `old(self).wf()`)
++            N > 0,
++            W::try_from_spec(N).is_ok(),
+             n < N,
+         ensures
+             final(self).wf(),
+@@ -303,6 +386,10 @@
+             n > 0 ==> exists|block: [W; N]|
+                 #[trigger] G::generate_post(&old(self).spec_core(), &final(self).spec_core(), &block)
+                     && final(self).buffer() == block@.subrange(n as int, N as int),
++            // Human spec
++            n == 0 ==> final(self).spec_core() === old(self).spec_core(),
++            n == 0 ==> forall|i: int|
++                1 <= i < N as int ==> final(self).spec_results()@[i] == old(self).spec_results()@[i],
+     {
+         if n == 0 {
+             self.set_index(N);
+@@ -326,13 +413,20 @@
+     #[inline]
+     pub fn word_offset(&self) -> (r: usize)
+         requires
+-            self.wf(),
++            // `wf()`, or more generally the developer's precondition of `remaining_results` (the
++            // index is in `1..=N`, which `wf()` implies: `lemma_wf_human`). The developer's
++            // precondition of `word_offset`, `N > 0` alone, does not suffice (SPEC_REVIEW.md, H4).
++            self.wf() || (N > 0 && exists|i: int|
++                1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                    self.spec_results()@[0],
++                )),
+         ensures
+             r == if self.buffer().len() == 0 {
+                 0
+             } else {
+                 N - self.buffer().len()
+             },
++            // (also the developer's postcondition)
+             r < N,
+     {
+         let index = self.index();
+@@ -350,9 +444,16 @@
+     #[inline]
+     pub fn remaining_results(&self) -> (r: &[W])
+         requires
+-            self.wf(),
++            // `wf()`, or more generally the developer's precondition (the index is in `1..=N`,
++            // without `N <= W::MAX`, which this method does not need; `wf()` implies it:
++            // `lemma_wf_human`)
++            self.wf() || (N > 0 && exists|i: int|
++                1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                    self.spec_results()@[0],
++                )),
+         ensures
+             r@ == self.buffer(),
++            // (also the developer's postcondition)
+             r@.len() < N,
+     {
+         let index = self.index();
+@@ -363,10 +464,32 @@
+     #[inline]
+     pub fn next_word(&mut self) -> (r: W)
+         requires
++            // (the developer's precondition: `lemma_wf_human`)
+             old(self).wf(),
+         ensures
+             final(self).wf(),
+             old(self).consumes(final(self), 1, seq![r]),
++            // Human spec
++            // Case 1: the buffer is not exhausted
++            forall|i: int|
++                0 <= i < N as int && #[trigger] index_is(old(self).spec_results()@[0], i) ==> {
++                    // return the word at the old index
++                    &&& r == old(self).spec_results()@[i]
++                    // core remains unchanged
++                    &&& final(self).spec_core() === old(self).spec_core()
++                    // the index advances by one.
++                    &&& index_is(final(self).spec_results()@[0], i + 1)
++                    // other buffered words remain unchanged
++                    &&& forall|j: int|
++                        1 <= j < N as int ==> final(self).spec_results()@[j] == old(
++                            self,
++                        ).spec_results()@[j]
++                },
++            // Case 2: the buffer is exhausted
++            index_is(old(self).spec_results()@[0], N as int) ==> index_is(
++                final(self).spec_results()@[0],
++                1,
++            ),
+     {
+         let ghost cores = seq![self.core];
+         let ghost blocks = Seq::<[W; N]>::empty();
+@@ -389,6 +512,20 @@
+             assert(self.buffer() =~= stream.subrange(1, stream.len() as int));
+             assert(Self::generates(cores, blocks));
+             assert(old(self).consumes(self, 1, seq![value]));
++            // the developer's clauses: the index `i` is the old index
++            assert forall|i: int|
++                0 <= i < N as int && #[trigger] index_is(old(self).spec_results()@[0], i) implies {
++                &&& value == old(self).spec_results()@[i]
++                &&& self.spec_core() === old(self).spec_core()
++                &&& index_is(self.spec_results()@[0], i + 1)
++                &&& forall|j: int|
++                    1 <= j < N as int ==> self.spec_results()@[j] == old(self).spec_results()@[j]
++            } by {
++                old(self).lemma_index_is(i);
++                self.lemma_index_is(i + 1);
++            }
++            old(self).lemma_index_is(N as int);
++            self.lemma_index_is(1);
+         }
+         value
+     }
+@@ -399,6 +536,7 @@
+     #[inline]
+     pub fn next_u64_from_u32(&mut self) -> (r: u64)
+         requires
++            // (the developer's precondition, with `N <= u32::MAX`: `lemma_wf_human`)
+             old(self).wf(),
+             N >= 2,
+         ensures
+@@ -406,6 +544,30 @@
+             exists|words: Seq<u32>|
+                 #[trigger] old(self).consumes(final(self), 2, words) && r == ((words[1] as u64)
+                     << 32u64) | (words[0] as u64),
++            // Human spec
++            // Case 1: two words are available in the buffer
++            (old(self).spec_results()@[0] as usize) < N - 1 ==> r
++                == ((old(self).spec_results()@[(old(self).spec_results()@[0] as int) + 1] as u64)
++                << 32) | (old(self).spec_results()@[old(self).spec_results()@[0] as int] as u64),
++            // no new block is generated
++            (old(self).spec_results()@[0] as usize) < N - 1 ==> forall|i: int|
++                1 <= i < N as int ==> final(self).spec_results()@[i] == old(self).spec_results()@[i],
++            // core remains unchanged
++            (old(self).spec_results()@[0] as usize) < N - 1
++                ==> final(self).spec_core() === old(self).spec_core(),
++            // the buffer index is updated appropriately
++            (old(self).spec_results()@[0] as usize) < N - 1
++                ==> final(self).spec_results()@[0] == old(self).spec_results()@[0] + 2,
++            // Case 2: one word remains
++            (old(self).spec_results()@[0] as usize) == N - 1
++                ==> (r & 0xFFFF_FFFFu64) == old(self).spec_results()@[N as int - 1] as u64,
++            (old(self).spec_results()@[0] as usize) == N - 1
++                ==> final(self).spec_results()@[0] == 1u32,
++            // Case 3: buffer exhausted
++            (old(self).spec_results()@[0] as usize) >= N
++                ==> (r >> 32) == final(self).spec_results()@[1] as u64,
++            (old(self).spec_results()@[0] as usize) >= N
++                ==> final(self).spec_results()@[0] == 2u32,
+     {
+         let ghost cores = seq![self.core];
+         let ghost blocks = Seq::<[u32; N]>::empty();
+@@ -440,6 +602,9 @@
+             assert(Self::generates(cores, blocks));
+             assert(old(self).consumes(self, 2, seq![lo, hi]));
+             assert(seq![lo, hi][1] == hi && seq![lo, hi][0] == lo);
++            // the developer's clauses: the low and high halves of the result
++            assert(((((hi as u64) << 32u64) | (lo as u64)) & 0xFFFF_FFFFu64) == lo as u64
++                && ((((hi as u64) << 32u64) | (lo as u64)) >> 32u64) == hi as u64) by (bit_vector);
+         }
+         (u64::from(hi) << 32) | u64::from(lo)
+     }
+@@ -450,9 +615,11 @@
+     #[inline]
+     pub fn fill_bytes(&mut self, dest: &mut [u8])
+         requires
++            // (the developer's precondition: `lemma_wf_human`)
+             old(self).wf(),
+         ensures
+             final(self).wf(),
++            // (also the developer's: destination length remains unchanged)
+             final(dest)@.len() == old(dest)@.len(),
+             // `dest` holds the little-endian bytes of the next `k` words, where `k` is the fewest
+             // words that cover `dest`; the rest of the last word is discarded.
+@@ -463,6 +630,46 @@
+                     &&& k * size_of::<W>() >= old(dest)@.len()
+                     &&& (k == 0 || (k - 1) * size_of::<W>() < old(dest)@.len())
+                 },
++            // Human spec
++            // empty destination -> entire RNG state unchanged
++            old(dest)@.len() == 0 ==> *final(self) === *old(self),
++            // the final buffer index is valid
++            exists|i: int|
++                1 <= i <= N as int && #[trigger] index_is(final(self).spec_results()@[0], i),
++            // Case 1: destination fits in the remaining buffer
++            forall|i: int|
++                1 <= i <= N as int && #[trigger] index_is(old(self).spec_results()@[0], i)
++                    && old(dest)@.len() as int <= (N as int - i) * (
++                vstd::layout::size_of::<W>() as int) ==> {
++                    // core remains unchanged
++                    &&& final(self).spec_core() === old(self).spec_core()
++                    // buffered words remain unchanged
++                    &&& forall|j: int|
++                        1 <= j < N as int ==> final(self).spec_results()@[j] == old(
++                            self,
++                        ).spec_results()@[j]
++                    // index advances by the number of words consumed
++                    &&& index_is(
++                        final(self).spec_results()@[0],
++                        i + (old(dest)@.len() as int + vstd::layout::size_of::<W>() as int - 1) / (
++                        vstd::layout::size_of::<W>() as int),
++                    )
++                },
++            // Case 2: regeneration is required
++            forall|i: int|
++                1 <= i <= N as int && #[trigger] index_is(old(self).spec_results()@[0], i)
++                    && old(dest)@.len() as int > (N as int - i) * (
++                vstd::layout::size_of::<W>() as int) ==> {
++                    let size = vstd::layout::size_of::<W>() as int;
++                    // bytes remaining in the old buffer
++                    let remaining = (N as int - i) * size;
++                    let extra = old(dest)@.len() as int - remaining;
++                    // number of words consumed from regenerated blocks.
++                    let words = (extra + size - 1) / size;
++                    // final index, accounting for multiple regenerations
++                    let new_index = ((words - 1) % N as int) + 1;
++                    index_is(final(self).spec_results()@[0], new_index)
++                },
+     {
+         let ghost len = dest@.len();
+         // The words consumed so far are `stream[..consumed]`, where `stream` is the buffer
+@@ -647,13 +854,23 @@
+         self.set_index(index);
+         proof {
+             self.lemma_inv_fill_end(&before, *old(self), cores, blocks, stream, consumed, index as int);
++            self.lemma_fill_bytes_human(
++                &before,
++                *old(self),
++                cores,
++                blocks,
++                stream,
++                consumed,
++                index as int,
++                len as int,
++            );
+         }
+     }
+ 
+     /// (ghost) The invariant of the loop of `fill_bytes`, which consumes words of `stream`, the
+     /// buffer of `start` followed by the generated `blocks`: `stream[..consumed]` are consumed,
+-    /// and the rest is `self.results[index..]`. Opaque, to keep the loop's proof small; the
+-    /// lemmas below are its only users.
++    /// and the rest is `self.results[index..]`; until a block is generated, the output buffer is
++    /// `start`'s. Opaque, to keep the loop's proof small; the lemmas below are its only users.
+     #[verifier::opaque]
+     closed spec fn inv_fill(
+         &self,
+@@ -673,6 +890,7 @@
+         &&& consumed + (N - index) == stream.len()
+         &&& stream.subrange(consumed as int, stream.len() as int) == self.results@.subrange(index, N as int)
+         &&& (blocks.len() > 0 ==> stream.len() - N < consumed || index == 0)
++        &&& (blocks.len() == 0 ==> self.results == start.results)
+     }
+ 
+     /// `inv_fill` holds at the start of `fill_bytes`.
+@@ -812,6 +1030,154 @@
+         assert(self.buffer() =~= stream.subrange(consumed as int, stream.len() as int));
+         assert(Self::generates(cores, blocks));
+     }
++
++    /// The developer's clauses of `fill_bytes(dest)` (`len == dest.len()`), from the state at the
++    /// end of its loop (`before`) and after `set_index` (`self`). `consumed`, the number of words
++    /// consumed, is the fewest that cover `len` bytes; `blocks`, those generated.
++    proof fn lemma_fill_bytes_human(
++        &self,
++        before: &Self,
++        start: Self,
++        cores: Seq<G>,
++        blocks: Seq<[W; N]>,
++        stream: Seq<W>,
++        consumed: nat,
++        index: int,
++        len: int,
++    )
++        requires
++            before.inv_fill(start, cores, blocks, stream, consumed, index),
++            start.wf(),
++            1 <= index,
++            self.spec_index() == index,
++            self.results@ == before.results@.update(0, self.results@[0]),
++            self.core == before.core,
++            0 <= len,
++            consumed * size_of::<W>() >= len,
++            consumed == 0 || (consumed - 1) * size_of::<W>() < len,
++        ensures
++            len == 0 ==> *self === start,
++            exists|i: int|
++                1 <= i <= N as int && #[trigger] index_is(self.spec_results()@[0], i),
++            forall|i: int|
++                1 <= i <= N as int && #[trigger] index_is(start.spec_results()@[0], i) && len <= (
++                N as int - i) * (vstd::layout::size_of::<W>() as int) ==> {
++                    &&& self.spec_core() === start.spec_core()
++                    &&& forall|j: int|
++                        1 <= j < N as int ==> self.spec_results()@[j] == start.spec_results()@[j]
++                    &&& index_is(
++                        self.spec_results()@[0],
++                        i + (len + vstd::layout::size_of::<W>() as int - 1) / (
++                        vstd::layout::size_of::<W>() as int),
++                    )
++                },
++            forall|i: int|
++                1 <= i <= N as int && #[trigger] index_is(start.spec_results()@[0], i) && len > (
++                N as int - i) * (vstd::layout::size_of::<W>() as int) ==> {
++                    let size = vstd::layout::size_of::<W>() as int;
++                    let remaining = (N as int - i) * size;
++                    let extra = len - remaining;
++                    let words = (extra + size - 1) / size;
++                    let new_index = ((words - 1) % N as int) + 1;
++                    index_is(self.spec_results()@[0], new_index)
++                },
++    {
++        reveal(BlockRng::inv_fill);
++        W::lemma_word();
++        lemma_blocks_words_len::<W, N, G>(blocks);
++        let (s, k, b, i0) = (size_of::<W>() as int, consumed as int, blocks.len() as int,
++            start.spec_index() as int);
++        // the stream is the `N - i0` words of the buffer, then the `b` blocks
++        assert(stream.len() == (N - i0) + b * N);
++        // the final index (`inv_fill`: `consumed + (N - index) == stream.len()`)
++        assert(index == i0 + k - b * N);
++        // the final index is in `1..=N`
++        self.lemma_index_is(index);
++        // `b` is 0 when the buffer covers `len`, else the fewest blocks that cover the rest
++        if b > 0 {
++            assert(stream.len() - N < k);
++            assert(b * N - N == (b - 1) * N) by (nonlinear_arith);
++            assert((b - 1) * N >= 0) by (nonlinear_arith)
++                requires
++                    b >= 1,
++                    N >= 0,
++            ;
++        }
++        if len == 0 {
++            if k > 0 {
++                assert((k - 1) * s >= 0) by (nonlinear_arith)
++                    requires
++                        k >= 1,
++                        s > 0,
++                ;
++            }
++            assert(b == 0);
++            // `results[0]` holds the old index again
++            W::lemma_value_injective(self.results@[0], start.results@[0]);
++            assert(self.results =~= start.results);
++        }
++        assert forall|i: int|
++            1 <= i <= N as int && #[trigger] index_is(start.spec_results()@[0], i) && len <= (N as int
++                - i) * (vstd::layout::size_of::<W>() as int) implies {
++            &&& self.spec_core() === start.spec_core()
++            &&& forall|j: int|
++                1 <= j < N as int ==> self.spec_results()@[j] == start.spec_results()@[j]
++            &&& index_is(
++                self.spec_results()@[0],
++                i + (len + vstd::layout::size_of::<W>() as int - 1) / (vstd::layout::size_of::<W>() as int),
++            )
++        } by {
++            start.lemma_index_is(i);
++            // `k <= N - i0` words, all from the buffer: no block is generated
++            if k > N - i0 {
++                assert((k - 1) * s >= (N - i0) * s) by (nonlinear_arith)
++                    requires
++                        k - 1 >= N - i0,
++                        s > 0,
++                ;
++            }
++            assert(b == 0);
++            lemma_ceil(len, s, k);
++        }
++        assert forall|i: int|
++            1 <= i <= N as int && #[trigger] index_is(start.spec_results()@[0], i) && len > (N as int
++                - i) * (vstd::layout::size_of::<W>() as int) implies {
++            let size = vstd::layout::size_of::<W>() as int;
++            let remaining = (N as int - i) * size;
++            let extra = len - remaining;
++            let words = (extra + size - 1) / size;
++            let new_index = ((words - 1) % N as int) + 1;
++            index_is(self.spec_results()@[0], new_index)
++        } by {
++            start.lemma_index_is(i);
++            // `k > N - i0`: the buffer is used up and `w` words come from `b >= 1` blocks
++            if k <= N - i0 {
++                assert(k * s <= (N - i0) * s) by (nonlinear_arith)
++                    requires
++                        k <= N - i0,
++                        s > 0,
++                ;
++            }
++            let w = k - (N - i0);
++            assert(w >= 1);
++            assert(b >= 1);
++            // `w` is the developer's `words`: the fewest words that cover the `extra` bytes
++            assert(w * s == k * s - (N - i0) * s && (w - 1) * s == (k - 1) * s - (N - i0) * s)
++                by (nonlinear_arith)
++                requires
++                    w == k - (N - i0),
++            ;
++            lemma_ceil(len - (N - i0) * s, s, w);
++            // and the developer's `new_index` is the final index, `w - (b - 1) * N`
++            assert((b - 1) * N == b * N - N) by (nonlinear_arith);
++            vstd::arithmetic::div_mod::lemma_fundamental_div_mod_converse(
++                w - 1,
++                N as int,
++                b - 1,
++                w - 1 - (b - 1) * N,
++            );
++        }
++    }
+ }
+ 
+ /// The first `c` elements of `s + t` are those of `s`.
+@@ -975,6 +1341,44 @@
+     assert(blocks.push(b).drop_last() =~= blocks);
+ }
+ 
++/// `blocks_words` has `N` words per block.
++proof fn lemma_blocks_words_len<W: Word, const N: usize, G: Generator<Output = [W; N]>>(
++    blocks: Seq<[W; N]>,
++)
++    ensures
++        BlockRng::<G>::blocks_words(blocks).len() == blocks.len() * N,
++    decreases blocks.len(),
++{
++    if blocks.len() > 0 {
++        lemma_blocks_words_len::<W, N, G>(blocks.drop_last());
++        assert((blocks.len() - 1) * N + N == blocks.len() * N) by (nonlinear_arith);
++    }
++}
++
++/// `k`, the fewest words of `s` bytes that cover `len` bytes, is the developer's
++/// `(len + s - 1) / s`.
++proof fn lemma_ceil(len: int, s: int, k: int)
++    requires
++        0 <= len,
++        0 < s,
++        0 <= k,
++        k * s >= len,
++        k == 0 || (k - 1) * s < len,
++    ensures
++        k == (len + s - 1) / s,
++{
++    let r = len + s - 1 - k * s;
++    if k > 0 {
++        assert((k - 1) * s == k * s - s) by (nonlinear_arith);
++    } else {
++        assert(k * s == 0) by (nonlinear_arith)
++            requires
++                k == 0,
++        ;
++    }
++    vstd::arithmetic::div_mod::lemma_fundamental_div_mod_converse(len + s - 1, s, k, r);
++}
++
+ /// `num_chunks`, the minimum of `rest / size` and the number of words left, covers at most
+ /// `rest` bytes; if it is `rest / size`, less than `size` bytes are left.
+ proof fn lemma_chunks(rest: int, size: int, num_chunks: int)
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/src/lib.rs verus_fixed/src/lib.rs
+--- verus/src/lib.rs	2026-11-18 19:27:12.494363559 -0500
++++ verus_fixed/src/lib.rs	2026-11-23 05:31:49.706670419 -0500
+@@ -99,6 +99,8 @@
+                     final(dst)@,
+                     res,
+                 ),
++            // Human spec
++            final(dst)@.len() == old(dst)@.len(),
+     ;
+ }
+ 
+@@ -264,6 +266,8 @@
+     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> (res: Result<(), Self::Error>)
+         ensures
+             Self::try_fill_bytes_post(old(self), final(self), old(dst)@, final(dst)@, res),
++            // Human spec
++            final(dst)@.len() == old(dst)@.len(),
+     ;
+ }
+ 
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/src/trusted.rs verus_fixed/src/trusted.rs
+--- verus/src/trusted.rs	2026-11-23 05:01:11.106606572 -0500
++++ verus_fixed/src/trusted.rs	2026-11-23 05:47:51.515679603 -0500
+@@ -10,7 +10,8 @@
+ //! but vstd does not specify them. Verus takes each specification on trust; each one states what
+ //! the standard library documents for the item, and none of them contains code. S2, S5 and S6 were
+ //! here until Verus 0.2026.11.22, whose vstd provides them with the same contracts (so they are
+-//! still trusted, as part of vstd).
++//! still trusted, as part of vstd). **S7** is not about the standard library: it restates, verbatim,
++//! the definition of a `closed` spec function of vstd that the developer's spec uses.
+ //!
+ //! | id | items | specification |
+ //! |----|-------|---------------|
+@@ -20,6 +21,7 @@
+ //! | S4 | trait `AsMut`; `<[T; N] as AsMut<[T]>>::as_mut` | no contract in general; on an array, the slice is the array (writes through it are writes to the array) |
+ //! | S5 | `<[T]>::copy_from_slice` | (now in vstd) requires equal lengths (otherwise it panics); `dst` becomes a copy of `src` |
+ //! | S6 | `u32::rotate_right` | (now in vstd, `vstd::wrapping::u32_specs::rotate_right`) rotation right by `n % 32` |
++//! | S7 | `vstd::bytes::spec_u32_from_le_bytes` | its definition in vstd (`closed`, so not usable outside vstd), verbatim: little-endian decoding. `check_trusted.py` compares it with vstd's source |
+ //!
+ //! **Code** (C1-C5) that Verus cannot check: upstream code, moved here unchanged except for
+ //! visibility, or one upstream expression or statement wrapped in a function. Each function has a
+@@ -218,6 +220,19 @@
+     u64::from_le_bytes(b)
+ }
+ 
++// ===== S7 =====
++
++/// The definition of vstd's `spec_u32_from_le_bytes` (`vstd/bytes.rs`), verbatim. vstd declares
++/// the function `closed`, so its definition cannot be used outside vstd (vstd exports the `u64`
++/// counterpart as the lemma `spec_u64_to_le_bytes_to_open`). The developer's spec uses it for
++/// `Word::spec_from_le_bytes`; `check_trusted.py` checks the expression against vstd's source.
++pub axiom fn axiom_spec_u32_from_le_bytes(s: Seq<u8>)
++    requires
++        s.len() == 4,
++    ensures
++        vstd::bytes::spec_u32_from_le_bytes(s) == (s[0] as u32) | (s[1] as u32) << 8 | (s[2] as u32) << 16 | (s[3] as u32) << 24,
++;
++
+ } // verus!
+ 
+ // ===== C1 =====
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/src/unwrap_err.rs verus_fixed/src/unwrap_err.rs
+--- verus/src/unwrap_err.rs	2026-11-18 18:45:46.295802007 -0500
++++ verus_fixed/src/unwrap_err.rs	2026-11-23 05:31:54.491492194 -0500
+@@ -86,9 +86,14 @@
+     /// coercion: essentially, the pointer is copied under a new, shorter, lifetime.
+     /// Until rfcs#1403 lands, reborrows on user types require a method call.
+     #[inline(always)]
+-    pub fn re<'b>(&'b mut self) -> UnwrapErr<&'b mut R>
++    pub fn re<'b>(&'b mut self) -> (result: UnwrapErr<&'b mut R>)
+     where
+         'r: 'b,
++        ensures
++            // Human spec: the result borrows the same generator: it has the generator's current
++            // state, and the state the generator is left in is the state the result leaves.
++            &*result.0 === &*old(self).0,
++            &*final(result.0) === &*final(self).0,
+     {
+         UnwrapErr(self.0)
+     }
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/src/utils.rs verus_fixed/src/utils.rs
+--- verus/src/utils.rs	2026-11-18 19:14:33.502741977 -0500
++++ verus_fixed/src/utils.rs	2026-11-23 05:32:22.743908966 -0500
+@@ -234,6 +234,9 @@
+                 },
+             Err(e) => next_word.ensures((), Err(e)),
+         },
++        // Human spec: an empty `dst` is left alone, without calling `next_word`.
++        old(dst)@.len() == 0 ==> res.is_ok(),
++        old(dst)@.len() == 0 ==> final(dst)@ === old(dst)@,
+ {
+     let ghost f = next_word;
+     let ghost len = dst@.len();
+@@ -347,10 +350,22 @@
+         src@.len() == N * size_of::<W>(),
+     ensures
+         le_bytes_of_words(r@) == src@,
++        // Human spec: each word is decoded from its corresponding input bytes in little-endian
++        // order. (The developer's precondition, `src@.len() == vstd::layout::size_of::<[W; N]>()`,
++        // cannot be established by any caller: see SPEC_REVIEW.md, H2.)
++        r@.len() == N,
++        forall|i: int|
++            0 <= i < N as int ==> r@[i] == W::spec_from_le_bytes(
++                src@.subrange(
++                    i * vstd::layout::size_of::<W>() as int,
++                    (i + 1) * vstd::layout::size_of::<W>() as int,
++                ),
++            ),
+ {
+     crate::trusted::check_read_words_len::<W, N>(src);
+     proof {
+         W::lemma_word();
++        W::lemma_spec_from_le_bytes();
+     }
+     let mut dst = [W::from_usize(0); N];
+     // `dst.iter_mut().zip(src.chunks_exact(size_of::<W>()))`: `src` has exactly `N` chunks
+@@ -369,6 +384,12 @@
+             src@.len() == N * size,
+             i <= N,
+             le_bytes_of_words(dst@.subrange(0, i as int)) == src@.subrange(0, i * size),
++            forall|j: int|
++                0 <= j < i ==> dst@[j] == W::spec_from_le_bytes(
++                    src@.subrange(j * size, (j + 1) * size),
++                ),
++            vstd::layout::size_of::<W>() == size,
++            forall|w: W| #[trigger] W::spec_from_le_bytes(w.spec_le_bytes()) == w,
+         decreases N - i,
+     {
+         proof {
+@@ -391,6 +412,8 @@
+             assert(dst@.subrange(0, i + 1) =~= dst@.subrange(0, i as int).push(dst@[i as int]));
+             lemma_le_bytes_of_words_push(dst@.subrange(0, i as int), dst@[i as int]);
+             assert(src@.subrange(0, (i + 1) * size) =~= src@.subrange(0, i * size) + chunk@);
++            // the developer's clause: the new word decodes its chunk
++            assert(W::spec_from_le_bytes(dst@[i as int].spec_le_bytes()) == dst@[i as int]);
+         }
+         i += 1;
+     }
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/src/word.rs verus_fixed/src/word.rs
+--- verus/src/word.rs	2026-11-18 19:05:12.332618730 -0500
++++ verus_fixed/src/word.rs	2026-11-23 06:58:12.357869848 -0500
+@@ -5,19 +5,86 @@
+ /// A marker trait for supported "word" types.
+ ///
+ /// This is implemented for: `u32`, `u64`.
+-pub trait Word: sealed::Sealed {}
++pub trait Word: sealed::Sealed {
++    /// (ghost, from the developer's spec) The word whose little-endian bytes are `bytes`.
++    spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self;
++
++    /// `spec_from_le_bytes` decodes the little-endian bytes of a word (what `to_le_bytes`
++    /// returns).
++    proof fn lemma_spec_from_le_bytes()
++        ensures
++            forall|w: Self| #[trigger] Self::spec_from_le_bytes(w.spec_le_bytes()) == w,
++    ;
++}
++
++/// `W::try_from(v)` for `v: usize` (the developer's spec states the index of a `BlockRng` as
++/// `W::try_from_spec(i as usize) === Ok(results[0])`): the word of value `v` if `v <= W::MAX`, an
++/// error otherwise. Broadcast in `block`.
++pub broadcast proof fn lemma_try_from_usize_spec<W: Word>(v: usize)
++    ensures
++        #![trigger W::try_from_spec(v)]
++        W::try_from_spec(v).is_ok() <==> v <= W::spec_max(),
++        W::try_from_spec(v).is_ok() ==> W::try_from_spec(v)->Ok_0.spec_value() == v,
++{
++    W::lemma_try_from_usize(v, W::try_from_spec(v)->Ok_0);
++}
++
++impl Word for u32 {
++    open spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self {
++        vstd::bytes::spec_u32_from_le_bytes(bytes)
++    }
++
++    proof fn lemma_spec_from_le_bytes() {
++        assert forall|w: u32|
++            #[trigger] Self::spec_from_le_bytes(<u32 as sealed::Sealed>::spec_le_bytes(w)) == w by {
++            let b = <u32 as sealed::Sealed>::spec_le_bytes(w);
++            crate::trusted::axiom_spec_u32_from_le_bytes(b);
++            let (b0, b1, b2, b3) = (b[0], b[1], b[2], b[3]);
++            assert(((b0 as u32) | ((b1 as u32) << 8u32) | ((b2 as u32) << 16u32) | ((b3 as u32)
++                << 24u32)) == w) by (bit_vector)
++                requires
++                    b0 == (w & 0xff) as u8,
++                    b1 == ((w >> 8u32) & 0xff) as u8,
++                    b2 == ((w >> 16u32) & 0xff) as u8,
++                    b3 == ((w >> 24u32) & 0xff) as u8,
++            ;
++        }
++    }
++}
+ 
+-impl Word for u32 {}
+-impl Word for u64 {}
++impl Word for u64 {
++    open spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self {
++        vstd::bytes::spec_u64_from_le_bytes(bytes)
++    }
++
++    proof fn lemma_spec_from_le_bytes() {
++        // vstd states the `u64` encoding (`spec_u64_to_le_bytes_to_open`), so no trusted fact is
++        // needed here, unlike for `u32`.
++        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
++        assert forall|w: u64|
++            #[trigger] Self::spec_from_le_bytes(<u64 as sealed::Sealed>::spec_le_bytes(w)) == w by {
++            vstd::bytes::spec_u64_to_le_bytes_to_open(w);
++            assert(<u64 as sealed::Sealed>::spec_le_bytes(w) =~= vstd::bytes::spec_u64_to_le_bytes_open(
++                w,
++            ));
++        }
++    }
++}
+ 
+ } // verus!
+ 
+-// (After the first item, so that the module documentation stays with `Word` in the expanded
+-// code that `detect_changes.py` compares; imports are order-independent.)
+ use vstd::prelude::*;
++// (Verus builds only: the trait of `try_from_spec`, the specification of `TryFrom::try_from`.)
++#[cfg(verus_keep_ghost)]
++use vstd::std_specs::convert::TryFromSpec;
+ 
+ mod sealed {
+     use vstd::prelude::*;
++    // (Verus builds only: the trait of `try_from_spec`, the specification of `TryFrom::try_from`,
++    // which the developer's spec uses to state the index of a `BlockRng`. Imports nothing in a
++    // normal build, where the ghost code that uses it is erased.)
++    #[cfg(verus_keep_ghost)]
++    use vstd::std_specs::convert::TryFromSpec;
+ 
+     verus! {
+ 
+@@ -41,6 +108,7 @@
+         proof fn lemma_word()
+             ensures
+                 size_of::<Self>() == 4 || size_of::<Self>() == 8,
++                vstd::layout::size_of::<Self>() == size_of::<Self>(),
+                 Self::spec_max() >= u32::MAX,
+                 forall|b: Self::Bytes| #[trigger] Self::spec_bytes(b).len() == size_of::<Self>(),
+                 forall|b: Self::Bytes, r: &[u8]|
+@@ -50,6 +118,21 @@
+                 forall|w: Self| #[trigger] w.spec_value() <= Self::spec_max(),
+         ;
+ 
++        /// A word is determined by its value.
++        proof fn lemma_value_injective(a: Self, b: Self)
++            ensures
++                a.spec_value() == b.spec_value() ==> a == b,
++        ;
++
++        /// `Self::try_from(v)` for `v: usize` (the developer's spec states the index of a
++        /// `BlockRng` as `W::try_from_spec(i) === Ok(results[0])`): the word of value `v` if
++        /// `v <= Self::MAX`, an error otherwise.
++        proof fn lemma_try_from_usize(v: usize, w: Self)
++            ensures
++                Self::try_from_spec(v).is_ok() <==> v <= Self::spec_max(),
++                Self::try_from_spec(v) === Ok(w) <==> (v <= Self::spec_max() && w.spec_value() == v),
++        ;
++
+         fn from_le_bytes(bytes: Self::Bytes) -> (r: Self)
+             ensures
+                 r.spec_le_bytes() == Self::spec_bytes(bytes),
+@@ -107,6 +190,12 @@
+         proof fn lemma_word() {
+         }
+ 
++        proof fn lemma_value_injective(a: Self, b: Self) {
++        }
++
++        proof fn lemma_try_from_usize(v: usize, w: Self) {
++        }
++
+         #[inline(always)]
+         fn from_le_bytes(bytes: Self::Bytes) -> Self {
+             proof {
+@@ -156,6 +245,12 @@
+         proof fn lemma_word() {
+         }
+ 
++        proof fn lemma_value_injective(a: Self, b: Self) {
++        }
++
++        proof fn lemma_try_from_usize(v: usize, w: Self) {
++        }
++
+         #[inline(always)]
+         fn from_le_bytes(bytes: Self::Bytes) -> Self {
+             proof {
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/check_trusted.py verus_fixed/verification/check_trusted.py
+--- verus/verification/check_trusted.py	2026-11-18 19:19:27.454033850 -0500
++++ verus_fixed/verification/check_trusted.py	2026-11-23 05:47:38.557546479 -0500
+@@ -9,7 +9,10 @@
+ 2. The code in `src/trusted.rs` is upstream's: C1 and C2 verbatim (C2 up to `pub(crate)` and its
+    contract), the statements wrapped by C3 and C4 verbatim, and C5 calls exactly the standard
+    library functions that upstream calls.
++3. The axiom S7 in `src/trusted.rs` states vstd's definition of `spec_u32_from_le_bytes`
++   verbatim (read from vstd's source in the cargo registry, at the version of `Cargo.toml`).
+ Exits 1 on any failure."""
++import glob
+ import os
+ import re
+ import sys
+@@ -26,6 +29,12 @@
+ # enables the unstable feature that the specifications in trusted.rs (`PointeeSized`) need. It
+ # changes nothing in a normal build and makes no code trusted.
+ ALLOWED = {'lib.rs': ['#![cfg_attr(verus_keep_ghost, feature(sized_hierarchy))]']}
++# A `#[cfg(verus_keep_ghost)]` attribute is also allowed on exactly this import, the next line:
++# in Verus builds it brings `try_from_spec` (the specification of `TryFrom::try_from`, used by
++# the developer's spec) into scope for ghost code; in a normal build the import is absent, and
++# the ghost code that uses it is erased. The trait has only spec functions, so the import cannot
++# change which exec function a call resolves to.
++GHOST_IMPORT = 'use vstd::std_specs::convert::TryFromSpec;'
+ 
+ failures = 0
+ 
+@@ -79,8 +88,12 @@
+     if not name.endswith('.rs') or name == 'trusted.rs':
+         continue
+     text = open(os.path.join(SRC, name)).read()
+-    for n, line in enumerate(text.split('\n'), 1):
++    lines = text.split('\n')
++    for n, line in enumerate(lines, 1):
+         code = line.split('//')[0]
++        if line.strip() == '#[cfg(verus_keep_ghost)]' and n < len(lines) \
++                and lines[n].strip() == GHOST_IMPORT:
++            continue
+         if TRUST.search(code) and line.strip() not in ALLOWED.get(name, []):
+             fail(f'{name}:{n}: trust construct outside trusted.rs: {line.strip()}')
+     rest = strip_attributes(strip_comments(outside_verus(text)))
+@@ -141,5 +154,28 @@
+ if not ok:
+     fail('C5 pcg32')
+ 
++# ---- 3. S7 is vstd's definition
++def squash(text):
++    return re.sub(r'\s+', '', text)
++
++
++m = re.search(r'pub axiom fn axiom_spec_u32_from_le_bytes\(s: Seq<u8>\)\s*requires\s*s\.len\(\) == 4,'
++              r'\s*ensures\s*vstd::bytes::spec_u32_from_le_bytes\(s\) == (.*?),\s*;', trusted, re.S)
++cargo = open(os.path.join(os.path.dirname(SRC), 'Cargo.toml')).read()
++ver = re.search(r'vstd = \{ version = "=([^"]+)"', cargo).group(1)
++paths = glob.glob(os.path.expanduser(f'~/.cargo/registry/src/*/vstd-{ver}/bytes.rs'))
++if not m:
++    fail('S7: axiom_spec_u32_from_le_bytes not found in trusted.rs')
++elif not paths:
++    fail(f'S7: vstd {ver} source (bytes.rs) not found in the cargo registry; run `cargo fetch`')
++else:
++    vstd_def = re.search(r'pub closed spec fn spec_u32_from_le_bytes\(s: Seq<u8>\) -> u32\s*'
++                         r'recommends\s*s\.len\(\) == 4,\s*\{(.*?)\}', open(paths[0]).read(), re.S)
++    ok = vstd_def and squash(vstd_def.group(1)) == squash(m.group(1))
++    print(f'S7 spec_u32_from_le_bytes: {"vstd" if ok else "DIFFERS FROM vstd"} {ver}: '
++          f'{" ".join(m.group(1).split())}')
++    if not ok:
++        fail('S7 differs from the definition in vstd')
++
+ print(f'{failures} failures')
+ sys.exit(1 if failures else 0)
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/claude_spec_client.rs verus_fixed/verification/claude_spec_client.rs
+--- verus/verification/claude_spec_client.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/claude_spec_client.rs	2026-11-23 05:53:20.303947278 -0500
+@@ -0,0 +1,174 @@
++//! Claude's first-pass contracts, verified against the fixed crate (not part of the crate).
++//!
++//! The amendments weakened four preconditions (`reconstruct`, `reset_and_skip`, `word_offset`,
++//! `remaining_results`) and only added postconditions. Each function below restates Claude's
++//! contract from `verus/src/` verbatim and implements it by calling the fixed crate's function,
++//! so its verification shows that clients written against Claude's contracts still verify.
++//!
++//! For the functions whose contracts only gained clauses, the restatement is immediate; they are
++//! included for the functions of `block.rs` and the two strengthened trait methods.
++//!
++//! Verified by `verify.sh` against the crate's exported specifications.
++
++use rand_core::block::{BlockRng, Generator};
++use rand_core::utils::{self, Word};
++use rand_core::{Infallible, Rng, TryRng};
++use vstd::prelude::*;
++
++verus! {
++
++// ===== lib.rs =====
++
++fn rng_fill_bytes<R: Rng>(rng: &mut R, dst: &mut [u8])
++    ensures
++        exists|res: Result<(), Infallible>|
++            #[trigger] R::try_fill_bytes_post(old(rng), final(rng), old(dst)@, final(dst)@, res),
++{
++    rng.fill_bytes(dst)
++}
++
++fn try_fill_bytes<R: TryRng>(rng: &mut R, dst: &mut [u8]) -> (res: Result<(), R::Error>)
++    ensures
++        R::try_fill_bytes_post(old(rng), final(rng), old(dst)@, final(dst)@, res),
++{
++    rng.try_fill_bytes(dst)
++}
++
++// ===== block.rs =====
++
++fn new<W: Word + Default, const N: usize, G: Generator<Output = [W; N]>>(core: G) -> (r: BlockRng<G>)
++    requires
++        0 < N <= W::spec_max(),
++    ensures
++        r.wf(),
++        r.buffer() == Seq::<W>::empty(),
++        r.spec_core() == core,
++{
++    BlockRng::new(core)
++}
++
++fn reconstruct<W: Word + Default, const N: usize, G: Generator<Output = [W; N]>>(
++    core: G,
++    remaining_results: &[W],
++) -> (r: Option<BlockRng<G>>)
++    requires
++        0 < N <= W::spec_max(),
++    ensures
++        remaining_results@.len() < N ==> (r matches Some(rng) && rng.wf() && rng.buffer()
++            == remaining_results@ && rng.spec_core() == core),
++        remaining_results@.len() >= N ==> r is None,
++{
++    // (generic `W`: the developer's `W::try_from_spec(N).is_ok()` is `N <= W::spec_max()`)
++    proof {
++        W::lemma_try_from_usize(N, vstd::pervasive::arbitrary());
++    }
++    BlockRng::reconstruct(core, remaining_results)
++}
++
++fn reset_and_skip<W: Word, const N: usize, G: Generator<Output = [W; N]>>(
++    rng: &mut BlockRng<G>,
++    n: usize,
++)
++    requires
++        old(rng).wf(),
++        n < N,
++    ensures
++        final(rng).wf(),
++        n == 0 ==> final(rng).buffer() == Seq::<W>::empty() && final(rng).spec_core() == old(
++            rng,
++        ).spec_core(),
++        n > 0 ==> exists|block: [W; N]|
++            #[trigger] G::generate_post(&old(rng).spec_core(), &final(rng).spec_core(), &block)
++                && final(rng).buffer() == block@.subrange(n as int, N as int),
++{
++    // (generic `N` and `W`: `wf()` gives the developer's precondition)
++    proof {
++        rng.lemma_wf_human();
++    }
++    rng.reset_and_skip(n)
++}
++
++fn word_offset<W: Word, const N: usize, G: Generator<Output = [W; N]>>(rng: &BlockRng<G>) -> (r: usize)
++    requires
++        rng.wf(),
++    ensures
++        r == if rng.buffer().len() == 0 {
++            0
++        } else {
++            N - rng.buffer().len()
++        },
++        r < N,
++{
++    rng.word_offset()
++}
++
++fn remaining_results<'a, W: Word, const N: usize, G: Generator<Output = [W; N]>>(
++    rng: &'a BlockRng<G>,
++) -> (r: &'a [W])
++    requires
++        rng.wf(),
++    ensures
++        r@ == rng.buffer(),
++        r@.len() < N,
++{
++    rng.remaining_results()
++}
++
++fn next_word<W: Word, const N: usize, G: Generator<Output = [W; N]>>(rng: &mut BlockRng<G>) -> (r: W)
++    requires
++        old(rng).wf(),
++    ensures
++        final(rng).wf(),
++        old(rng).consumes(final(rng), 1, seq![r]),
++{
++    rng.next_word()
++}
++
++fn next_u64_from_u32<const N: usize, G: Generator<Output = [u32; N]>>(rng: &mut BlockRng<G>) -> (r: u64)
++    requires
++        old(rng).wf(),
++        N >= 2,
++    ensures
++        final(rng).wf(),
++        exists|words: Seq<u32>|
++            #[trigger] old(rng).consumes(final(rng), 2, words) && r == ((words[1] as u64) << 32u64)
++                | (words[0] as u64),
++{
++    rng.next_u64_from_u32()
++}
++
++fn fill_bytes<W: Word, const N: usize, G: Generator<Output = [W; N]>>(
++    rng: &mut BlockRng<G>,
++    dest: &mut [u8],
++)
++    requires
++        old(rng).wf(),
++    ensures
++        final(rng).wf(),
++        final(dest)@.len() == old(dest)@.len(),
++        exists|k: nat, words: Seq<W>|
++            {
++                &&& #[trigger] old(rng).consumes(final(rng), k, words)
++                &&& final(dest)@ == utils::le_bytes_of_words(words).subrange(0, old(dest)@.len() as int)
++                &&& k * size_of::<W>() >= old(dest)@.len()
++                &&& (k == 0 || (k - 1) * size_of::<W>() < old(dest)@.len())
++            },
++{
++    rng.fill_bytes(dest)
++}
++
++// ===== utils.rs =====
++
++fn read_words<W: Word, const N: usize>(src: &[u8]) -> (r: [W; N])
++    requires
++        src@.len() == N * size_of::<W>(),
++    ensures
++        utils::le_bytes_of_words(r@) == src@,
++{
++    utils::read_words(src)
++}
++
++fn main() {
++}
++
++} // verus!
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/developer_spec/h1_compose.rs verus_fixed/verification/developer_spec/h1_compose.rs
+--- verus/verification/developer_spec/h1_compose.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/developer_spec/h1_compose.rs	2026-11-23 06:09:41.420014710 -0500
+@@ -0,0 +1,39 @@
++//! H1: the developer's `BlockRng` contracts do not compose. Verified against the developer's crate
++//! (`../../../verus_human_written_spec/`); both calls fail with "precondition not satisfied".
++
++use rand_core::block::{BlockRng, Generator};
++use vstd::prelude::*;
++
++verus! {
++
++pub struct Zeros;
++
++impl Generator for Zeros {
++    type Output = [u32; 4];
++
++    fn generate(&mut self, output: &mut [u32; 4]) {
++        *output = [0u32; 4];
++    }
++}
++
++/// `next_word` on a new `BlockRng`.
++fn new_then_next_word() {
++    let mut rng = BlockRng::new(Zeros);
++    let _ = rng.next_word();
++}
++
++/// `remaining_results` on a reconstructed `BlockRng`.
++fn reconstruct_then_remaining_results() {
++    let rest: [u32; 2] = [7, 8];
++    match BlockRng::<Zeros>::reconstruct(Zeros, &rest) {
++        Some(rng) => {
++            let _ = rng.remaining_results();
++        },
++        None => {},
++    }
++}
++
++fn main() {
++}
++
++} // verus!
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/developer_spec/h2_array_size.rs verus_fixed/verification/developer_spec/h2_array_size.rs
+--- verus/verification/developer_spec/h2_array_size.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/developer_spec/h2_array_size.rs	2026-11-23 06:09:41.420014710 -0500
+@@ -0,0 +1,18 @@
++//! H2: the precondition of the developer's `read_words`,
++//! `src@.len() == vstd::layout::size_of::<[W; N]>()`, cannot be established: vstd does not state the
++//! size of an array, not even for concrete types. Fails with "postcondition not satisfied".
++
++use vstd::prelude::*;
++
++verus! {
++
++proof fn size_of_u32_array()
++    ensures
++        vstd::layout::size_of::<[u32; 2]>() == 8,
++{
++}
++
++fn main() {
++}
++
++} // verus!
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/developer_spec/h5_control.rs verus_fixed/verification/developer_spec/h5_control.rs
+--- verus/verification/developer_spec/h5_control.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/developer_spec/h5_control.rs	2026-11-23 06:09:41.420014710 -0500
+@@ -0,0 +1,39 @@
++//! The control for `h5_matching_loop.rs`: the same client against the fixed crate, whose
++//! `next_word` states the developer's clauses with `index_is` triggers. The assertion fails at once.
++
++use rand_core::block::{BlockRng, Generator};
++use vstd::prelude::*;
++#[cfg(verus_keep_ghost)]
++use vstd::std_specs::convert::TryFromSpec;
++
++verus! {
++
++pub struct Zeros;
++
++impl Generator for Zeros {
++    type Output = [u32; 4];
++
++    open spec fn generate_post(pre: &Self, post: &Self, output: &[u32; 4]) -> bool {
++        true
++    }
++
++    fn generate(&mut self, output: &mut [u32; 4]) {
++        *output = [0u32; 4];
++    }
++}
++
++fn one_call(rng: &mut BlockRng<Zeros>)
++    requires
++        u32::try_from_spec(2usize) === Ok(old(rng).spec_results()@[0]),
++{
++    proof {
++        rng.lemma_wf_human();
++    }
++    let _ = rng.next_word();
++    assert(false);
++}
++
++fn main() {
++}
++
++} // verus!
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/developer_spec/h5_matching_loop.rs verus_fixed/verification/developer_spec/h5_matching_loop.rs
+--- verus/verification/developer_spec/h5_matching_loop.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/developer_spec/h5_matching_loop.rs	2026-11-23 06:09:41.420014710 -0500
+@@ -0,0 +1,33 @@
++//! H5: the developer's postconditions of `next_word` form a matching loop. One call, then an
++//! assertion that should simply fail: against the developer's crate the solver runs out of
++//! resources; against the fixed crate (`h5_control.rs`) the assertion fails at once.
++
++use rand_core::block::{BlockRng, Generator};
++use vstd::prelude::*;
++#[cfg(verus_keep_ghost)]
++use vstd::std_specs::convert::TryFromSpec;
++
++verus! {
++
++pub struct Zeros;
++
++impl Generator for Zeros {
++    type Output = [u32; 4];
++
++    fn generate(&mut self, output: &mut [u32; 4]) {
++        *output = [0u32; 4];
++    }
++}
++
++fn one_call(rng: &mut BlockRng<Zeros>)
++    requires
++        u32::try_from_spec(2usize) === Ok(old(rng).spec_results()@[0]),
++{
++    let _ = rng.next_word();
++    assert(false);
++}
++
++fn main() {
++}
++
++} // verus!
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/developer_spec_findings.py verus_fixed/verification/developer_spec_findings.py
+--- verus/verification/developer_spec_findings.py	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/developer_spec_findings.py	2026-11-23 06:10:01.043212194 -0500
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Reproduce the findings about the developer's spec (SPEC_REVIEW.md, H1-H5) with Verus.
++
++- H1: `developer_spec/h1_compose.rs` against the developer's crate (`../verus_human_written_spec`):
++  both calls fail with "precondition not satisfied".
++- H2: `developer_spec/h2_array_size.rs`: vstd cannot prove `size_of::<[u32; 2]>() == 8`.
++- H3: a scratch copy of this crate with the developer's (missing) precondition of
++  `fill_bytes_via_next_word`: the calls of `next_word` in the body fail.
++- H4: a scratch copy of this crate with the developer's precondition of `word_offset` (`N > 0`):
++  the `unwrap` in `index` (`into_usize`) can no longer be proved.
++- H5: `developer_spec/h5_matching_loop.rs` against the developer's crate runs out of resources;
++  `developer_spec/h5_control.rs`, the same client against this crate, fails its assertion at once.
++
++Usage: python3 verus_fixed/verification/developer_spec_findings.py, with `verus` on PATH or
++VERUS=/path/to/verus. Exits 1 if any finding does not reproduce."""
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++CASES = os.path.join(HERE, 'developer_spec')
++CRATE = os.path.dirname(HERE)
++DEVELOPER = os.path.join(os.path.dirname(CRATE), 'verus_human_written_spec')
++VERUS = os.environ.get('VERUS', shutil.which('verus') or 'verus')
++
++failures = 0
++
++
++def run(args, cwd):
++    r = subprocess.run([VERUS] + args, capture_output=True, text=True, cwd=cwd)
++    return r.stdout + r.stderr
++
++
++def errors(out):
++    return [l for l in out.splitlines() if l.startswith('error') and 'aborting' not in l]
++
++
++def check(name, ok, detail):
++    global failures
++    print(f'{name}: {"reproduced" if ok else "NOT REPRODUCED"}  {detail}')
++    failures += not ok
++
++
++def crate_copy(tmp, src_crate, name):
++    dst = os.path.join(tmp, name)
++    shutil.copytree(src_crate, dst, ignore=shutil.ignore_patterns('target', 'verification', '.verus-*'))
++    return dst
++
++
++def client(tmp, crate, case):
++    """Verify `developer_spec/<case>` against `crate` (exported as `rand_core`)."""
++    out_dir = tempfile.mkdtemp(dir=tmp)
++    lib, vir = os.path.join(out_dir, 'librand_core.rlib'), os.path.join(out_dir, 'rand_core.vir')
++    run(['--crate-type=lib', '--edition=2024', '--crate-name', 'rand_core',
++         os.path.join(crate, 'src', 'lib.rs'), '--export', vir, '--compile', '-o', lib], out_dir)
++    return run(['--edition=2024', os.path.join(CASES, case), '-o', os.path.join(out_dir, 'client'),
++                '--extern', f'rand_core={lib}', '--import', f'rand_core={vir}'], out_dir)
++
++
++def patched(tmp, name, fname, edits):
++    """Verify a copy of this crate with `edits` [(old, new)] applied to `src/<fname>`."""
++    crate = crate_copy(tmp, CRATE, name)
++    path = os.path.join(crate, 'src', fname)
++    text = open(path).read()
++    for old, new in edits:
++        assert text.count(old) == 1, f'{name}: edit site not found once: {old[:60]!r}'
++        text = text.replace(old, new)
++    open(path, 'w').write(text)
++    return run(['--crate-type=lib', '--edition=2024', os.path.join(crate, 'src', 'lib.rs')], crate)
++
++
++with tempfile.TemporaryDirectory() as tmp:
++    developer = crate_copy(tmp, DEVELOPER, 'developer')
++
++    out = client(tmp, developer, 'h1_compose.rs')
++    errs = errors(out)
++    check('H1', len(errs) == 2 and all('precondition not satisfied' in e for e in errs),
++          f'new -> next_word, reconstruct -> remaining_results: {errs}')
++
++    out = run(['--edition=2024', os.path.join(CASES, 'h2_array_size.rs'), '-o',
++               os.path.join(tmp, 'h2')], tmp)
++    errs = errors(out)
++    check('H2', errs == ['error: postcondition not satisfied'], f'size_of::<[u32; 2]>() == 8: {errs}')
++
++    out = patched(tmp, 'h3', 'utils.rs', [
++        ('''    requires
++        forall|| next_word.requires(()),
++    ensures
++        final(dst)@.len() == old(dst)@.len(),''', '''    ensures
++        final(dst)@.len() == old(dst)@.len(),'''),
++        ('''            next_word == f,
++            forall|| next_word.requires(()),''', '''            next_word == f,'''),
++    ])
++    errs = errors(out)
++    check('H3', len(errs) == 2 and all('callee.requires(args)' in e for e in errs),
++          f'fill_bytes_via_next_word without a precondition on next_word: {errs}')
++
++    out = patched(tmp, 'h4', 'block.rs', [
++        ('''            self.wf() || (N > 0 && exists|i: int|
++                1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                    self.spec_results()@[0],
++                )),
++        ensures
++            r == if self.buffer().len() == 0 {''', '''            N > 0,
++        ensures
++            r == if self.buffer().len() == 0 {'''),
++        ('''            0 < N,
++            self.spec_index() <= N,
++        ensures
++            r == self.spec_index(),''', '''            0 < N,
++        ensures
++            r == self.spec_index(),'''),
++    ])
++    errs = errors(out)
++    at_index = 'self.results[0].into_usize()' in out
++    check('H4', errs == ['error: precondition not satisfied'] and at_index,
++          f'word_offset with only `N > 0`: {errs} (at `into_usize` in `index`: {at_index})')
++
++    out = client(tmp, developer, 'h5_matching_loop.rs')
++    loop_errs = errors(out)
++    out = client(tmp, CRATE, 'h5_control.rs')
++    control_errs = errors(out)
++    check('H5', any('rlimit' in e for e in loop_errs) and control_errs == ['error: assertion failed'],
++          f'developer\'s crate: {loop_errs}; fixed crate: {control_errs}')
++
++print(f'{failures} findings not reproduced')
++sys.exit(1 if failures else 0)
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/differential/Cargo.toml verus_fixed/verification/differential/Cargo.toml
+--- verus/verification/differential/Cargo.toml	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/differential/Cargo.toml	2026-11-23 06:47:32.069184673 -0500
+@@ -0,0 +1,15 @@
++# Differential test of the annotated crate against upstream (not part of the crate). Run `run.sh`.
++[package]
++name = "rand_core_differential"
++version = "0.0.0"
++edition = "2024"
++publish = false
++
++[dependencies]
++# Upstream, as a copy renamed `rand_core_upstream` (made by `run.sh`: Cargo cannot build two
++# packages `rand_core` 0.10.1 together), and the annotated crate, `verus_fixed/` itself.
++up = { package = "rand_core_upstream", path = "target/upstream-copy" }
++ann = { package = "rand_core", path = "../.." }
++
++[workspace]
++exclude = ["target/upstream-copy"]
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/differential/run.sh verus_fixed/verification/differential/run.sh
+--- verus/verification/differential/run.sh	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/differential/run.sh	2026-11-23 06:47:32.069184673 -0500
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++# Differential test of the annotated crate (`verus_fixed/`) against upstream (`src/`): see
++# src/main.rs. Cargo cannot build two packages named `rand_core` 0.10.1 together, so this copies
++# upstream's `src/`, `Cargo.toml` and `README.md` to `target/upstream-copy`, renamed
++# `rand_core_upstream`, then runs the test in a debug build (upstream's `debug_assert!`s on) and a
++# release build. Usage (from anywhere): verus_fixed/verification/differential/run.sh
++set -euo pipefail
++here="$(cd "$(dirname "$0")" && pwd)"
++repo="$(cd "$here/../../.." && pwd)"
++copy="$here/target/upstream-copy"
++rm -rf "$copy"
++mkdir -p "$copy"
++cp -r "$repo/src" "$repo/README.md" "$copy/"
++sed 's/^name = "rand_core"$/name = "rand_core_upstream"/' "$repo/Cargo.toml" > "$copy/Cargo.toml"
++grep -q '^name = "rand_core_upstream"$' "$copy/Cargo.toml"
++cd "$here"
++cargo run -q
++cargo run -q --release
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/differential/rust-toolchain.toml verus_fixed/verification/differential/rust-toolchain.toml
+--- verus/verification/differential/rust-toolchain.toml	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/differential/rust-toolchain.toml	2026-11-23 06:46:05.374940038 -0500
+@@ -0,0 +1,2 @@
++[toolchain]
++channel = "1.100.0"
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/differential/src/main.rs verus_fixed/verification/differential/src/main.rs
+--- verus/verification/differential/src/main.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/differential/src/main.rs	2026-11-23 06:49:08.459275857 -0500
+@@ -0,0 +1,469 @@
++//! Differential test: upstream `rand_core` (`up`, the repository's `src/`) and the annotated crate
++//! (`ann`, `verus_fixed/`) side by side, on every function whose code verification changed. Each
++//! result, every byte written, the state observed after each step and each panic message must be
++//! equal. Run both `cargo run` (upstream's `debug_assert!`s are on) and `cargo run --release`.
++
++use std::cell::Cell;
++use std::fmt;
++use std::panic::{self, AssertUnwindSafe};
++
++thread_local! {
++    /// Set while `catch` runs: the panics there are expected, and compared rather than printed.
++    static QUIET: Cell<bool> = const { Cell::new(false) };
++}
++
++/// Test inputs (xorshift64; not under test).
++#[derive(Clone)]
++struct Xs(u64);
++
++impl Xs {
++    fn next(&mut self) -> u64 {
++        let mut x = self.0;
++        x ^= x << 13;
++        x ^= x >> 7;
++        x ^= x << 17;
++        self.0 = x;
++        x
++    }
++
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n
++    }
++}
++
++/// `f()`, or its panic message.
++fn catch<T>(f: impl FnOnce() -> T) -> Result<T, String> {
++    QUIET.with(|q| q.set(true));
++    let r = panic::catch_unwind(AssertUnwindSafe(f));
++    QUIET.with(|q| q.set(false));
++    r.map_err(|e| {
++        if let Some(s) = e.downcast_ref::<String>() {
++            s.clone()
++        } else if let Some(s) = e.downcast_ref::<&str>() {
++            s.to_string()
++        } else {
++            "<non-string panic>".to_string()
++        }
++    })
++}
++
++#[derive(Default)]
++struct Checker {
++    comparisons: usize,
++    panics: usize,
++}
++
++impl Checker {
++    fn eq<T: PartialEq + fmt::Debug>(&mut self, what: &str, up: T, ann: T) {
++        self.comparisons += 1;
++        if up != ann {
++            eprintln!("DIFFERENCE in {what}:\n  upstream:  {up:?}\n  annotated: {ann:?}");
++            std::process::exit(1);
++        }
++    }
++
++    fn eq_result<T: PartialEq + fmt::Debug>(&mut self, what: &str, up: Result<T, String>, ann: Result<T, String>) {
++        self.panics += up.is_err() as usize;
++        self.eq(what, up, ann);
++    }
++}
++
++// ===== block: one generator type implementing both crates' `Generator`
++
++macro_rules! generator {
++    ($name:ident, $w:ty, $mul:expr) => {
++        #[derive(Clone, Debug, PartialEq)]
++        struct $name<const N: usize> {
++            state: $w,
++        }
++
++        impl<const N: usize> $name<N> {
++            fn block(&mut self) -> [$w; N] {
++                let mut out = [0; N];
++                for w in out.iter_mut() {
++                    self.state = self.state.wrapping_mul($mul).wrapping_add(1);
++                    *w = self.state ^ (self.state >> 7);
++                }
++                out
++            }
++        }
++
++        impl<const N: usize> up::block::Generator for $name<N> {
++            type Output = [$w; N];
++            fn generate(&mut self, output: &mut [$w; N]) {
++                *output = self.block();
++            }
++        }
++
++        impl<const N: usize> ann::block::Generator for $name<N> {
++            type Output = [$w; N];
++            fn generate(&mut self, output: &mut [$w; N]) {
++                *output = self.block();
++            }
++        }
++    };
++}
++
++generator!(Gen32, u32, 0x9E37_79B9);
++generator!(Gen64, u64, 0x9E37_79B9_7F4A_7C15);
++
++/// Random operations on a `BlockRng` of each crate, compared after every step.
++macro_rules! block_test {
++    ($fname:ident, $gen:ident, $w:ty, $u64_from_u32:tt) => {
++        fn $fname<const N: usize>(seed: u64, steps: usize, c: &mut Checker) {
++            let mut x = Xs(seed | 1);
++            let size = std::mem::size_of::<$w>();
++            let mut a = up::block::BlockRng::new($gen::<N> { state: seed as $w });
++            let mut b = ann::block::BlockRng::new($gen::<N> { state: seed as $w });
++            for _ in 0..steps {
++                match x.below(8) {
++                    0 | 1 => c.eq_result("next_word", catch(|| a.next_word()), catch(|| b.next_word())),
++                    2 if $u64_from_u32 => {
++                        // (`next_u64_from_u32` exists for `u32` words only)
++                        let ra = catch(|| block_test!(@u64 a, $u64_from_u32));
++                        let rb = catch(|| block_test!(@u64 b, $u64_from_u32));
++                        let panicked = ra.is_err();
++                        c.eq_result("next_u64_from_u32", ra, rb);
++                        if panicked {
++                            // `N == 1`: it panics after `generate`, leaving a generated word as
++                            // the index (see `corrupted_state`); continue from a well-formed state.
++                            a.reset_and_skip(0);
++                            b.reset_and_skip(0);
++                        }
++                    }
++                    2 | 3 => {
++                        let len = x.below(3 * (N * size) as u64 + 5) as usize;
++                        let (mut da, mut db) = (vec![0xA5u8; len], vec![0xA5u8; len]);
++                        let ra = catch(|| a.fill_bytes(&mut da));
++                        let rb = catch(|| b.fill_bytes(&mut db));
++                        c.eq_result("fill_bytes", ra.map(|_| da), rb.map(|_| db));
++                    }
++                    4 => {
++                        // includes `n >= N`, which panics in both
++                        let n = x.below(N as u64 + 2) as usize;
++                        c.eq_result("reset_and_skip", catch(|| a.reset_and_skip(n)), catch(|| b.reset_and_skip(n)));
++                    }
++                    5 => c.eq("word_offset", a.word_offset(), b.word_offset()),
++                    6 => {
++                        // from `remaining_results` (round trip), or a slice of any length
++                        let rest: Vec<$w> = if x.below(2) == 0 {
++                            a.remaining_results().to_vec()
++                        } else {
++                            (0..x.below(N as u64 + 2)).map(|_| x.next() as $w).collect()
++                        };
++                        let ra = catch(|| up::block::BlockRng::<$gen<N>>::reconstruct(a.core.clone(), &rest));
++                        let rb = catch(|| ann::block::BlockRng::<$gen<N>>::reconstruct(b.core.clone(), &rest));
++                        c.eq("reconstruct is_some", ra.as_ref().map(|r| r.is_some()), rb.as_ref().map(|r| r.is_some()));
++                        if let (Ok(Some(ra)), Ok(Some(rb))) = (ra, rb) {
++                            a = ra;
++                            b = rb;
++                        }
++                    }
++                    _ => {
++                        a = a.clone();
++                        b = b.clone();
++                    }
++                }
++                c.eq("remaining_results", a.remaining_results().to_vec(), b.remaining_results().to_vec());
++                c.eq("core", &a.core, &b.core);
++            }
++        }
++    };
++    (@u64 $r:ident, true) => {
++        $r.next_u64_from_u32()
++    };
++    (@u64 $r:ident, false) => {
++        unreachable!()
++    };
++}
++
++block_test!(block_u32, Gen32, u32, true);
++block_test!(block_u64, Gen64, u64, false);
++
++/// `reconstruct` with `N == 0` (`new` panics there in both crates).
++fn block_empty(c: &mut Checker) {
++    let ra = catch(|| up::block::BlockRng::<Gen32<0>>::reconstruct(Gen32 { state: 1 }, &[]).is_none());
++    let rb = catch(|| ann::block::BlockRng::<Gen32<0>>::reconstruct(Gen32 { state: 1 }, &[]).is_none());
++    c.eq_result("reconstruct, N = 0", ra, rb);
++    let ra = catch(|| up::block::BlockRng::<Gen32<0>>::reconstruct(Gen32 { state: 1 }, &[7]).is_none());
++    let rb = catch(|| ann::block::BlockRng::<Gen32<0>>::reconstruct(Gen32 { state: 1 }, &[7]).is_none());
++    c.eq_result("reconstruct, N = 0, one word", ra, rb);
++    let ra = catch(|| up::block::BlockRng::new(Gen32::<0> { state: 1 }).word_offset());
++    let rb = catch(|| ann::block::BlockRng::new(Gen32::<0> { state: 1 }).word_offset());
++    c.eq_result("new, N = 0", ra, rb);
++}
++
++/// The state that a caught panic between `generate` and `set_index` leaves: the word stored as the
++/// index is a generated word. `next_u64_from_u32` with `N == 1` panics there on every call (as does
++/// a panicking `Generator::generate`). Only two results differ, both only in this state: returns
++/// the descriptions of the differences seen.
++fn corrupted_state(c: &mut Checker) -> Vec<&'static str> {
++    let mut seen = vec![];
++    for seed in 1..=200u64 {
++        let mut a = up::block::BlockRng::new(Gen32::<1> { state: seed as u32 });
++        let mut b = ann::block::BlockRng::new(Gen32::<1> { state: seed as u32 });
++        c.eq_result("next_u64_from_u32, N = 1", catch(|| a.next_u64_from_u32()), catch(|| b.next_u64_from_u32()));
++        c.eq("word_offset, corrupted", a.word_offset(), b.word_offset());
++        c.eq("core, corrupted", &a.core, &b.core);
++        // 1. `remaining_results`: `&results[index..]` vs `&results[index..N]`, an index above `N`
++        let ra = catch(|| a.remaining_results().to_vec());
++        let rb = catch(|| b.remaining_results().to_vec());
++        c.eq("remaining_results panics, corrupted", ra.is_err(), rb.is_err());
++        if ra != rb {
++            let (ma, mb) = (ra.unwrap_err(), rb.unwrap_err());
++            c.eq("remaining_results, corrupted: upstream's message", ma.starts_with("range start index "), true);
++            c.eq("remaining_results, corrupted: annotated message", mb.starts_with("slice index starts at "), true);
++            seen.push("remaining_results: both panic (index > N), with different messages");
++        }
++        // 2. `fill_bytes` of nothing stores the index back: upstream's `debug_assert!` in `set_index`
++        let fa = catch(|| a.fill_bytes(&mut []));
++        let fb = catch(|| b.fill_bytes(&mut []));
++        if fa != fb {
++            c.eq("fill_bytes(&mut []), corrupted: debug build", cfg!(debug_assertions), true);
++            c.eq("fill_bytes(&mut []), corrupted: upstream", fa, Err("assertion failed: 0 < index && index <= N".to_string()));
++            c.eq("fill_bytes(&mut []), corrupted: annotated", fb, Ok(()));
++            seen.push("fill_bytes(&mut []): upstream's debug_assert in set_index fires (debug builds only)");
++        }
++        // both recover: the next word regenerates the block
++        c.eq_result("next_word, corrupted", catch(|| a.next_word()), catch(|| b.next_word()));
++        c.eq("remaining_results, recovered", a.remaining_results().to_vec(), b.remaining_results().to_vec());
++    }
++    seen.sort();
++    seen.dedup();
++    seen
++}
++
++// ===== utils
++
++/// `fill_bytes_via_next_word` with `next_word` failing at call `fail_at` (or never).
++macro_rules! fill_via_next_word_test {
++    ($fname:ident, $w:ty) => {
++        fn $fname(c: &mut Checker) {
++            for len in 0..=41usize {
++                for fail_at in (0..=12).map(Some).chain([None]) {
++                    let run = |f: &dyn Fn(&mut [u8], &mut dyn FnMut() -> Result<$w, usize>) -> Result<(), usize>| {
++                        let mut x = Xs(len as u64 * 31 + 7);
++                        let mut calls = 0usize;
++                        let mut dst = vec![0x5Au8; len];
++                        let r = f(&mut dst, &mut || {
++                            calls += 1;
++                            if Some(calls - 1) == fail_at { Err(calls) } else { Ok(x.next() as $w) }
++                        });
++                        (r, dst, calls)
++                    };
++                    let a = run(&|d, nw| up::utils::fill_bytes_via_next_word(d, nw));
++                    let b = run(&|d, nw| ann::utils::fill_bytes_via_next_word(d, nw));
++                    c.eq("fill_bytes_via_next_word", a, b);
++                }
++            }
++        }
++    };
++}
++
++fill_via_next_word_test!(fill_via_next_word_u32, u32);
++fill_via_next_word_test!(fill_via_next_word_u64, u64);
++
++#[derive(Debug, PartialEq)]
++struct SrcError(u32);
++
++impl fmt::Display for SrcError {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "source failed at call {}", self.0)
++    }
++}
++
++impl core::error::Error for SrcError {}
++
++/// A byte and word source implementing both crates' `TryRng`, failing at call `fail_at`.
++#[derive(Clone, Debug, PartialEq)]
++struct Src {
++    x: u64,
++    calls: u32,
++    fail_at: Option<u32>,
++    fill_lens: Vec<usize>,
++}
++
++impl Src {
++    fn new(seed: u64, fail_at: Option<u32>) -> Src {
++        Src { x: seed | 1, calls: 0, fail_at, fill_lens: vec![] }
++    }
++
++    fn step(&mut self) -> Result<u64, SrcError> {
++        self.calls += 1;
++        if Some(self.calls) == self.fail_at {
++            return Err(SrcError(self.calls));
++        }
++        let mut xs = Xs(self.x);
++        let v = xs.next();
++        self.x = xs.0;
++        Ok(v)
++    }
++
++    fn fill(&mut self, dst: &mut [u8]) -> Result<(), SrcError> {
++        self.fill_lens.push(dst.len());
++        let v = self.step()?;
++        for (i, b) in dst.iter_mut().enumerate() {
++            *b = (v >> (8 * (i % 8))) as u8 ^ i as u8;
++        }
++        Ok(())
++    }
++}
++
++macro_rules! src_try_rng {
++    ($krate:ident) => {
++        impl $krate::TryRng for Src {
++            type Error = SrcError;
++            fn try_next_u32(&mut self) -> Result<u32, SrcError> {
++                self.step().map(|v| v as u32)
++            }
++            fn try_next_u64(&mut self) -> Result<u64, SrcError> {
++                self.step()
++            }
++            fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), SrcError> {
++                self.fill(dst)
++            }
++        }
++    };
++}
++
++src_try_rng!(up);
++src_try_rng!(ann);
++
++fn via_fill_and_u32(c: &mut Checker) {
++    for seed in 1..=40u64 {
++        for fail_at in [None, Some(1), Some(2), Some(3)] {
++            let (mut a, mut b) = (Src::new(seed, fail_at), Src::new(seed, fail_at));
++            let ra = up::utils::next_word_via_fill::<u32, Src>(&mut a);
++            let rb = ann::utils::next_word_via_fill::<u32, Src>(&mut b);
++            c.eq("next_word_via_fill::<u32>", (ra, a), (rb, b));
++            let (mut a, mut b) = (Src::new(seed, fail_at), Src::new(seed, fail_at));
++            let ra = up::utils::next_word_via_fill::<u64, Src>(&mut a);
++            let rb = ann::utils::next_word_via_fill::<u64, Src>(&mut b);
++            c.eq("next_word_via_fill::<u64>", (ra, a), (rb, b));
++            let (mut a, mut b) = (Src::new(seed, fail_at), Src::new(seed, fail_at));
++            let ra = up::utils::next_u64_via_u32(&mut a);
++            let rb = ann::utils::next_u64_via_u32(&mut b);
++            c.eq("next_u64_via_u32", (ra, a), (rb, b));
++        }
++    }
++}
++
++/// `read_words::<W, N>` on every length from 0 to `N * size + 2` (wrong lengths panic in both).
++macro_rules! read_words_test {
++    ($c:ident, $w:ty, $($n:literal),*) => {$(
++        for len in 0..=($n * std::mem::size_of::<$w>() + 2) {
++            let src: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
++            let ra = catch(|| up::utils::read_words::<$w, $n>(&src));
++            let rb = catch(|| ann::utils::read_words::<$w, $n>(&src));
++            $c.eq_result(concat!("read_words::<", stringify!($w), ", ", $n, ">"), ra, rb);
++        }
++    )*};
++}
++
++// ===== seedable_rng: the seed that `seed_from_u64` passes to `from_seed`, for seeds of any length
++
++#[derive(Clone)]
++struct Seed<const L: usize>([u8; L]);
++
++impl<const L: usize> Default for Seed<L> {
++    fn default() -> Self {
++        Seed([0; L])
++    }
++}
++
++impl<const L: usize> AsRef<[u8]> for Seed<L> {
++    fn as_ref(&self) -> &[u8] {
++        &self.0
++    }
++}
++
++impl<const L: usize> AsMut<[u8]> for Seed<L> {
++    fn as_mut(&mut self) -> &mut [u8] {
++        &mut self.0
++    }
++}
++
++struct Recorder<const L: usize>([u8; L]);
++
++impl<const L: usize> up::SeedableRng for Recorder<L> {
++    type Seed = Seed<L>;
++    fn from_seed(seed: Seed<L>) -> Self {
++        Recorder(seed.0)
++    }
++}
++
++impl<const L: usize> ann::SeedableRng for Recorder<L> {
++    type Seed = Seed<L>;
++    fn from_seed(seed: Seed<L>) -> Self {
++        Recorder(seed.0)
++    }
++}
++
++macro_rules! seed_test {
++    ($c:ident, $($l:literal),*) => {$(
++        let mut x = Xs(0x5eed);
++        for i in 0..300u64 {
++            let state = match i { 0 => 0, 1 => 1, 2 => u64::MAX, _ => x.next() };
++            let a = <Recorder<$l> as up::SeedableRng>::seed_from_u64(state).0;
++            let b = <Recorder<$l> as ann::SeedableRng>::seed_from_u64(state).0;
++            $c.eq(concat!("seed_from_u64, seed length ", $l), a, b);
++        }
++    )*};
++}
++
++// ===== unwrap_err: the panic of `UnwrapErr` (its `panic_msg` moved to `trusted.rs`)
++
++fn unwrap_err(c: &mut Checker) {
++    for fail_at in [Some(1), None] {
++        let mut a = up::UnwrapErr(Src::new(3, fail_at));
++        let mut b = ann::UnwrapErr(Src::new(3, fail_at));
++        let ra = catch(|| up::Rng::next_u32(&mut a));
++        let rb = catch(|| ann::Rng::next_u32(&mut b));
++        c.eq_result("UnwrapErr::next_u32", ra, rb);
++        let ra = catch(|| up::Rng::next_u64(&mut a));
++        let rb = catch(|| ann::Rng::next_u64(&mut b));
++        c.eq_result("UnwrapErr::next_u64", ra, rb);
++        let (mut da, mut db) = ([0u8; 5], [0u8; 5]);
++        let ra = catch(|| up::Rng::fill_bytes(&mut a, &mut da));
++        let rb = catch(|| ann::Rng::fill_bytes(&mut b, &mut db));
++        c.eq_result("UnwrapErr::fill_bytes", ra.map(|_| da), rb.map(|_| db));
++    }
++}
++
++fn main() {
++    let default_hook = panic::take_hook();
++    panic::set_hook(Box::new(move |info| {
++        if !QUIET.with(|q| q.get()) {
++            default_hook(info)
++        }
++    }));
++    let mut c = Checker::default();
++    for seed in 1..=12u64 {
++        block_u32::<1>(seed, 1500, &mut c);
++        block_u32::<2>(seed, 1500, &mut c);
++        block_u32::<3>(seed, 1500, &mut c);
++        block_u32::<4>(seed, 1500, &mut c);
++        block_u32::<16>(seed, 1500, &mut c);
++        block_u64::<1>(seed, 1500, &mut c);
++        block_u64::<5>(seed, 1500, &mut c);
++        block_u64::<8>(seed, 1500, &mut c);
++    }
++    block_empty(&mut c);
++    let corrupted = corrupted_state(&mut c);
++    fill_via_next_word_u32(&mut c);
++    fill_via_next_word_u64(&mut c);
++    via_fill_and_u32(&mut c);
++    read_words_test!(c, u32, 0, 1, 2, 3, 8);
++    read_words_test!(c, u64, 0, 1, 2, 3, 8);
++    seed_test!(c, 0, 1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 31, 32, 33, 40, 64);
++    unwrap_err(&mut c);
++    println!(
++        "{} build: {} comparisons, all equal ({} of them of panics, with equal messages)",
++        if cfg!(debug_assertions) { "debug" } else { "release" },
++        c.comparisons,
++        c.panics,
++    );
++    for d in corrupted {
++        println!("  after a caught panic between `generate` and `set_index` only: {d}");
++    }
++}
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/gap_clients.rs verus_fixed/verification/gap_clients.rs
+--- verus/verification/gap_clients.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/gap_clients.rs	2026-11-23 05:55:39.487397081 -0500
+@@ -0,0 +1,77 @@
++//! Calls that the fixed contracts allow and Claude's first-pass contracts do not (not part of
++//! the crate). Each is valid upstream code. Against the fixed crate all of them verify
++//! (`verify.sh`); against Claude's first pass (`../verus`), each of the four fails, as recorded in
++//! SPEC_REVIEW.md (`negative_controls.py --first-pass` runs both).
++
++use rand_core::block::{BlockRng, Generator};
++use rand_core::{Rng, TryRng, UnwrapErr};
++use vstd::prelude::*;
++
++verus! {
++
++/// A block generator of zeros.
++#[derive(Clone)]
++pub struct Zeros;
++
++impl Generator for Zeros {
++    type Output = [u32; 4];
++
++    open spec fn generate_post(pre: &Self, post: &Self, output: &[u32; 4]) -> bool {
++        output@ == seq![0u32, 0u32, 0u32, 0u32]
++    }
++
++    fn generate(&mut self, output: &mut [u32; 4]) {
++        *output = [0u32; 4];
++        proof {
++            assert(output@ =~= seq![0u32, 0u32, 0u32, 0u32]);
++        }
++    }
++}
++
++/// A1: `fill_bytes` leaves `dst` its length (first pass: unknown to the caller).
++fn gap_fill_bytes_len<R: Rng>(rng: &mut R, dst: &mut [u8])
++    requires
++        old(dst)@.len() == 4,
++{
++    rng.fill_bytes(dst);
++    assert(dst@.len() == 4);
++}
++
++/// A2: `UnwrapErr::re` reborrows the same generator (first pass: no contract).
++fn gap_re<R: TryRng>(u: &mut UnwrapErr<&mut R>) {
++    let ghost before = *u.0;
++    let v = u.re();
++    assert(*v.0 == before);
++}
++
++/// A3: `reconstruct` with an empty block returns `None` upstream (first pass: requires `N > 0`).
++pub struct Empty;
++
++impl Generator for Empty {
++    type Output = [u32; 0];
++
++    open spec fn generate_post(pre: &Self, post: &Self, output: &[u32; 0]) -> bool {
++        true
++    }
++
++    fn generate(&mut self, output: &mut [u32; 0]) {
++    }
++}
++
++fn gap_reconstruct_empty_block() {
++    let r = BlockRng::<Empty>::reconstruct(Empty, &[]);
++    assert(r is None);
++}
++
++/// A4: `reset_and_skip` makes any `BlockRng` well-formed, e.g. a clone, whose state Verus does not
++/// know (the derived `Clone` has no contract). First pass: requires the clone to be well-formed.
++fn gap_reset_clone(rng: &BlockRng<Zeros>) {
++    let mut c = rng.clone();
++    c.reset_and_skip(0);
++    let x = c.next_word();
++}
++
++fn main() {
++}
++
++} // verus!
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/human_spec_client.rs verus_fixed/verification/human_spec_client.rs
+--- verus/verification/human_spec_client.rs	1969-12-31 19:00:00.000000000 -0500
++++ verus_fixed/verification/human_spec_client.rs	2026-11-23 05:49:49.826088395 -0500
+@@ -0,0 +1,380 @@
++//! The developer's contracts, verified against the fixed crate (not part of the crate).
++//!
++//! Each function below restates a contract of the developer's spec
++//! (`verus_human_written_spec/src/`) and implements it by calling the fixed crate's function.
++//! The `requires` and `ensures` clauses are the developer's, verbatim, including their triggers.
++//! That a wrapper verifies shows that the fixed contract refines the developer's: the
++//! developer's precondition implies the fixed one, and the fixed postcondition implies the
++//! developer's. The developer's contracts that are only `ensures true` are left out.
++//!
++//! Three wrappers need one more precondition than the developer's, marked `EXTRA`: there the
++//! developer's precondition does not suffice (SPEC_REVIEW.md, H2, H3 and H4).
++//!
++//! Verified by `verify.sh` against the crate's exported specifications, like
++//! `client_examples.rs`.
++
++use rand_core::block::{BlockRng, Generator, index_is};
++use rand_core::utils::{self, Word};
++use rand_core::{Rng, TryRng, UnwrapErr};
++use vstd::prelude::*;
++#[cfg(verus_keep_ghost)]
++use vstd::std_specs::convert::TryFromSpec;
++
++verus! {
++
++// ===== lib.rs =====
++
++fn rng_fill_bytes<R: Rng>(rng: &mut R, dst: &mut [u8])
++    ensures
++        final(dst)@.len() == old(dst)@.len(),
++{
++    rng.fill_bytes(dst)
++}
++
++fn try_fill_bytes<R: TryRng>(rng: &mut R, dst: &mut [u8]) -> (result: Result<(), R::Error>)
++    ensures
++        final(dst)@.len() == old(dst)@.len(),
++{
++    rng.try_fill_bytes(dst)
++}
++
++// ===== block.rs =====
++
++/// `N` fits in `W` (the developer's `W::try_from_spec(N).is_ok()`).
++proof fn lemma_fits<W: Word>(n: usize)
++    ensures
++        W::try_from_spec(n).is_ok() <==> n <= W::spec_max(),
++{
++    W::lemma_try_from_usize(n, vstd::pervasive::arbitrary());
++}
++
++fn new<W: Word + Default, const N: usize, G: Generator<Output = [W; N]>>(core: G) -> (result:
++    BlockRng<G>)
++    requires
++        N > 0,
++        W::try_from_spec(N).is_ok(),
++    ensures
++        result.spec_core() === core,
++{
++    proof {
++        lemma_fits::<W>(N);
++    }
++    BlockRng::new(core)
++}
++
++fn reconstruct<W: Word + Default, const N: usize, G: Generator<Output = [W; N]>>(
++    core: G,
++    remaining_results: &[W],
++) -> (result: Option<BlockRng<G>>)
++    requires
++        remaining_results@.len() < N ==> W::try_from_spec(N).is_ok(),
++    ensures
++        (result is None) <==> remaining_results@.len() >= N,
++        match result {
++            Some(r) => r.spec_core() === core,
++            None => true,
++        },
++{
++    BlockRng::reconstruct(core, remaining_results)
++}
++
++fn reset_and_skip<W: Word, const N: usize, G: Generator<Output = [W; N]>>(
++    rng: &mut BlockRng<G>,
++    n: usize,
++)
++    requires
++        N > 0,
++        W::try_from_spec(N).is_ok(),
++        n < N,
++    ensures
++        n == 0 ==> final(rng).spec_core() === old(rng).spec_core(),
++        n == 0 ==> forall|i: int|
++            1 <= i < N as int ==> final(rng).spec_results()@[i] == old(rng).spec_results()@[i],
++{
++    rng.reset_and_skip(n)
++}
++
++fn word_offset<W: Word, const N: usize, G: Generator<Output = [W; N]>>(rng: &BlockRng<G>) -> (result:
++    usize)
++    requires
++        N > 0,
++        // EXTRA (H4): the index is in `1..=N`, as for `remaining_results`
++        exists|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                rng.spec_results()@[0],
++            ),
++    ensures
++        result < N,
++{
++    proof {
++        let i = choose|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                rng.spec_results()@[0],
++            );
++        assert(index_is(rng.spec_results()@[0], i));
++    }
++    rng.word_offset()
++}
++
++fn remaining_results<'a, W: Word, const N: usize, G: Generator<Output = [W; N]>>(
++    rng: &'a BlockRng<G>,
++) -> (result: &'a [W])
++    requires
++        N > 0,
++        exists|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                rng.spec_results()@[0],
++            ),
++    ensures
++        result@.len() < N,
++{
++    proof {
++        let i = choose|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                rng.spec_results()@[0],
++            );
++        assert(index_is(rng.spec_results()@[0], i));
++    }
++    rng.remaining_results()
++}
++
++fn next_word<W: Word, const N: usize, G: Generator<Output = [W; N]>>(rng: &mut BlockRng<G>) -> (result: W)
++    requires
++        N > 0,
++        W::try_from_spec(N).is_ok(),
++        exists|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old(rng).spec_results()@[0],
++            ),
++    ensures
++        // Case 1: the buffer is not exhausted
++        forall|i: int|
++            0 <= i < N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old(rng).spec_results()@[0],
++            ) ==> {
++                // return the word at the old index
++                &&& result == old(rng).spec_results()@[i]
++                // core remains unchanged
++                &&& final(rng).spec_core() === old(rng).spec_core()
++                // the index advances by one.
++                &&& W::try_from_spec((i + 1) as usize) === Ok(final(rng).spec_results()@[0])
++                // other buffered words remain unchanged
++                &&& forall|j: int|
++                    1 <= j < N as int ==> final(rng).spec_results()@[j] == old(
++                        rng,
++                    ).spec_results()@[j]
++            },
++        // Case 2: the buffer is exhausted
++        W::try_from_spec(N) === Ok(old(rng).spec_results()@[0]) ==> W::try_from_spec(1usize)
++            === Ok(final(rng).spec_results()@[0]),
++{
++    proof {
++        rng.lemma_wf_human();
++    }
++    let ghost old_rng = *rng;
++    let result = rng.next_word();
++    proof {
++        assert forall|i: int|
++            0 <= i < N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old_rng.spec_results()@[0],
++            ) implies {
++            &&& result == old_rng.spec_results()@[i]
++            &&& rng.spec_core() === old_rng.spec_core()
++            &&& W::try_from_spec((i + 1) as usize) === Ok(rng.spec_results()@[0])
++            &&& forall|j: int|
++                1 <= j < N as int ==> rng.spec_results()@[j] == old_rng.spec_results()@[j]
++        } by {
++            assert(index_is(old_rng.spec_results()@[0], i));
++        }
++        assert(index_is(old_rng.spec_results()@[0], N as int) ==> index_is(
++            rng.spec_results()@[0],
++            1,
++        ));
++    }
++    result
++}
++
++fn next_u64_from_u32<const N: usize, G: Generator<Output = [u32; N]>>(rng: &mut BlockRng<G>) -> (result: u64)
++    requires
++        N >= 2,
++        N <= u32::MAX as usize,
++        exists|i: int|
++            1 <= i <= N as int && #[trigger] u32::try_from_spec(i as usize) === Ok(
++                old(rng).spec_results()@[0],
++            ),
++    ensures
++        // Case 1: two words are available in the buffer
++        (old(rng).spec_results()@[0] as usize) < N - 1 ==> result == ((old(
++            rng,
++        ).spec_results()@[(old(rng).spec_results()@[0] as int) + 1] as u64) << 32) | (old(
++            rng,
++        ).spec_results()@[old(rng).spec_results()@[0] as int] as u64),
++        // no new block is generated
++        (old(rng).spec_results()@[0] as usize) < N - 1 ==> forall|i: int|
++            1 <= i < N as int ==> final(rng).spec_results()@[i] == old(rng).spec_results()@[i],
++        // core remains unchanged
++        (old(rng).spec_results()@[0] as usize) < N - 1 ==> final(rng).spec_core() === old(
++            rng,
++        ).spec_core(),
++        // the buffer index is updated appropriately
++        (old(rng).spec_results()@[0] as usize) < N - 1 ==> final(rng).spec_results()@[0] == old(
++            rng,
++        ).spec_results()@[0] + 2,
++        // Case 2: one word remains
++        (old(rng).spec_results()@[0] as usize) == N - 1 ==> (result & 0xFFFF_FFFFu64) == old(
++            rng,
++        ).spec_results()@[N as int - 1] as u64,
++        (old(rng).spec_results()@[0] as usize) == N - 1 ==> final(rng).spec_results()@[0] == 1u32,
++        // Case 3: buffer exhausted
++        (old(rng).spec_results()@[0] as usize) >= N ==> (result >> 32) == final(rng).spec_results()@[1] as u64,
++        (old(rng).spec_results()@[0] as usize) >= N ==> final(rng).spec_results()@[0] == 2u32,
++{
++    proof {
++        rng.lemma_wf_human();
++    }
++    rng.next_u64_from_u32()
++}
++
++fn fill_bytes<W: Word, const N: usize, G: Generator<Output = [W; N]>>(
++    rng: &mut BlockRng<G>,
++    dest: &mut [u8],
++)
++    requires
++        N > 0,
++        W::try_from_spec(N).is_ok(),
++        exists|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old(rng).spec_results()@[0],
++            ),
++    ensures
++        // destination length remains unchanged
++        final(dest)@.len() == old(dest)@.len(),
++        // empty destination -> entire RNG state unchanged
++        old(dest)@.len() == 0 ==> *final(rng) === *old(rng),
++        // the final buffer index is valid
++        exists|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                final(rng).spec_results()@[0],
++            ),
++        // Case 1: destination fits in the remaining buffer
++        forall|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old(rng).spec_results()@[0],
++            ) && old(dest)@.len() as int <= (N as int - i) * (vstd::layout::size_of::<W>() as int)
++                ==> {
++                // core remains unchanged
++                &&& final(rng).spec_core() === old(rng).spec_core()
++                // buffered words remain unchanged
++                &&& forall|j: int|
++                    1 <= j < N as int ==> final(rng).spec_results()@[j] == old(
++                        rng,
++                    ).spec_results()@[j]
++                // index advances by the number of words consumed
++                &&& W::try_from_spec(
++                    (i + (old(dest)@.len() as int + vstd::layout::size_of::<W>() as int - 1) / (
++                    vstd::layout::size_of::<W>() as int)) as usize,
++                ) === Ok(final(rng).spec_results()@[0])
++            },
++        // Case 2: regeneration is required
++        forall|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old(rng).spec_results()@[0],
++            ) && old(dest)@.len() as int > (N as int - i) * (vstd::layout::size_of::<W>() as int)
++                ==> {
++                let size = vstd::layout::size_of::<W>() as int;
++                // bytes remaining in the old buffer
++                let remaining = (N as int - i) * size;
++                let extra = old(dest)@.len() as int - remaining;
++                // number of words consumed from regenerated blocks.
++                let words = (extra + size - 1) / size;
++                // final index, accounting for multiple regenerations
++                let new_index = ((words - 1) % N as int) + 1;
++                W::try_from_spec(new_index as usize) === Ok(final(rng).spec_results()@[0])
++            },
++{
++    proof {
++        rng.lemma_wf_human();
++    }
++    let ghost old_rng = *rng;
++    let ghost len = dest@.len() as int;
++    rng.fill_bytes(dest);
++    proof {
++        let s = vstd::layout::size_of::<W>() as int;
++        let i = choose|i: int| 1 <= i <= N as int && #[trigger] index_is(rng.spec_results()@[0], i);
++        assert(W::try_from_spec(i as usize) === Ok(rng.spec_results()@[0]));
++        assert forall|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old_rng.spec_results()@[0],
++            ) && len <= (N as int - i) * s implies {
++            &&& rng.spec_core() === old_rng.spec_core()
++            &&& forall|j: int|
++                1 <= j < N as int ==> rng.spec_results()@[j] == old_rng.spec_results()@[j]
++            &&& W::try_from_spec((i + (len + s - 1) / s) as usize) === Ok(rng.spec_results()@[0])
++        } by {
++            assert(index_is(old_rng.spec_results()@[0], i));
++        }
++        assert forall|i: int|
++            1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                old_rng.spec_results()@[0],
++            ) && len > (N as int - i) * s implies {
++            let words = ((len - (N as int - i) * s) + s - 1) / s;
++            W::try_from_spec((((words - 1) % N as int) + 1) as usize) === Ok(
++                rng.spec_results()@[0],
++            )
++        } by {
++            assert(index_is(old_rng.spec_results()@[0], i));
++        }
++    }
++}
++
++// ===== utils.rs =====
++
++fn fill_bytes_via_next_word<E, W: Word>(
++    dst: &mut [u8],
++    next_word: impl FnMut() -> Result<W, E>,
++) -> (result: Result<(), E>)
++    requires
++        // EXTRA (H3): `next_word` may be called
++        forall|| next_word.requires(()),
++    ensures
++        final(dst)@.len() == old(dst)@.len(),
++        old(dst)@.len() == 0 ==> result.is_ok(),
++        old(dst)@.len() == 0 ==> final(dst)@ === old(dst)@,
++{
++    utils::fill_bytes_via_next_word(dst, next_word)
++}
++
++fn read_words<W: Word, const N: usize>(src: &[u8]) -> (result: [W; N])
++    requires
++        src@.len() == vstd::layout::size_of::<[W; N]>(),
++        // EXTRA (H2): vstd does not state the size of an array, so the developer's precondition
++        // says nothing about the length of `src`
++        src@.len() == N * size_of::<W>(),
++    ensures
++        result@.len() == N,
++        // each word is decoded from its corresponding input bytes in little-endian order
++        forall|i: int|
++            0 <= i < N as int ==> result@[i] == W::spec_from_le_bytes(
++                src@.subrange(
++                    i * vstd::layout::size_of::<W>() as int,
++                    (i + 1) * vstd::layout::size_of::<W>() as int,
++                ),
++            ),
++{
++    utils::read_words(src)
++}
++
++// ===== unwrap_err.rs =====
++
++fn re<'r, 'b, R: TryRng + ?Sized>(u: &'b mut UnwrapErr<&'r mut R>) -> (result: UnwrapErr<&'b mut R>)
++    ensures
++        &*result.0 === &*old(u).0,
++        &*final(result.0) === &*final(u).0,
++{
++    u.re()
++}
++
++fn main() {
++}
++
++} // verus!
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/negative_controls.py verus_fixed/verification/negative_controls.py
+--- verus/verification/negative_controls.py	2026-11-23 04:55:08.790513292 -0500
++++ verus_fixed/verification/negative_controls.py	2026-11-23 05:57:50.697452247 -0500
+@@ -3,9 +3,17 @@
+ check that Verus rejects it. A mutant that verifies would mean the specifications do not
+ constrain that behaviour.
+ 
+-Usage: python3 verus/verification/negative_controls.py, with `verus` on PATH or
+-VERUS=/path/to/verus. Exits 1 if any mutant verifies (or if the unmutated crate does not)."""
++M23-M27 target the clauses that the review added from the developer's spec. Claude's first pass
++(`../verus`) accepts each of them: its specifications do not constrain these behaviours.
++
++Usage: python3 verus_fixed/verification/negative_controls.py, with `verus` on PATH or
++VERUS=/path/to/verus. Exits 1 if any mutant verifies (or if the unmutated crate does not).
++
++With `--first-pass`, it checks the gaps in Claude's first pass instead: each of M23-M27 must
++verify on a scratch copy of `../verus`, and each of the 4 calls in `gap_clients.rs` must fail to
++verify against it (they all verify against this crate: `verify.sh`)."""
+ import os
++import re
+ import shutil
+ import subprocess
+ import sys
+@@ -13,6 +21,7 @@
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ CRATE = os.path.dirname(HERE)
++FIRST_PASS = os.path.join(os.path.dirname(CRATE), 'verus')
+ VERUS = os.environ.get('VERUS', shutil.which('verus') or 'verus')
+ 
+ # (id, description, file, old text, new text). `old` must occur exactly once in `file`. For a
+@@ -106,7 +115,78 @@
+         ((x >> 8u32) & 0xff) as u8,
+         (x & 0xff) as u8,
+     ]'''),
++    # ---- M23-M27: behaviours that only the clauses added from the developer's spec rule out.
++    # Claude's first pass accepts each of them (`--first-pass`).
++    ('M23', 'fill_bytes_via_next_word: an empty dst still calls next_word and returns its error',
++     'utils.rs', '''    proof {
++        W::lemma_word();
++    }
++    // `dst.chunks_exact_mut(size_of::<W>())`''', '''    proof {
++        W::lemma_word();
++    }
++    if dst.len() == 0 {
++        let _ = next_word()?;
++    }
++    // `dst.chunks_exact_mut(size_of::<W>())`'''),
++    ('M24', 'next_word: zeroes the consumed word in the buffer (it is no longer in `buffer()`)',
++     'block.rs', '''        let value = self.results[index];
++        self.set_index(index + 1);''', '''        let value = self.results[index];
++        if index > 0 {
++            self.results[index] = W::from_usize(0);
++        }
++        self.set_index(index + 1);'''),
++    ('M25', 'fill_bytes: with an empty dest, overwrites a consumed word',
++     'block.rs', '''            self.lemma_inv_fill_end(&before, *old(self), cores, blocks, stream, consumed, index as int);''',
++     '''            self.lemma_inv_fill_end(&before, *old(self), cores, blocks, stream, consumed, index as int);
++        }
++        let ghost before3 = *self;
++        if dest.len() == 0 && index > 1 {
++            self.results[1] = self.results[0];
++            proof {
++                assert(self.buffer() =~= before3.buffer());
++            }
++        }
++        proof {
++            // (for the first pass: Claude's `consumes` still holds of the changed state)
++            assert(old(self).consumes(self, consumed, stream.subrange(0, consumed as int)));
++        }
++        proof {'''),
++    ('M26', 'reset_and_skip(0): also overwrites the old words of the buffer',
++     'block.rs', '''        if n == 0 {
++            self.set_index(N);
++            return;
++        }''', '''        if n == 0 {
++            self.set_index(N);
++            if N > 1 {
++                self.results[1] = self.results[0];
++            }
++            return;
++        }'''),
++    ('M27', 'next_u64_from_u32: with the buffer exhausted, zeroes the word it used as `hi`',
++     'block.rs', '''        self.set_index(new_index);
++        proof {
++            lemma_blocks_words_at_most_one::<u32, N, G>(blocks);''', '''        if index >= N {
++            self.results[1] = 0;
++        }
++        self.set_index(new_index);
++        proof {
++            lemma_blocks_words_at_most_one::<u32, N, G>(blocks);'''),
+ ]
++GAP = ['M23', 'M24', 'M25', 'M26', 'M27']
++
++
++def mutate(src, fname, old, new):
++    """Apply a mutation in place; returns the original text, or None if a site is not unique."""
++    path = os.path.join(src, fname)
++    orig = open(path).read()
++    olds, news = (old, new) if isinstance(old, list) else ([old], [new])
++    if any(orig.count(o) != 1 for o in olds):
++        return None
++    mutated = orig
++    for o, n in zip(olds, news):
++        mutated = mutated.replace(o, n)
++    open(path, 'w').write(mutated)
++    return orig
+ 
+ 
+ def verify(src_dir):
+@@ -130,16 +210,11 @@
+             sys.exit(1)
+         for mid, desc, fname, old, new in MUTANTS:
+             path = os.path.join(src, fname)
+-            orig = open(path).read()
+-            olds, news = (old, new) if isinstance(old, list) else ([old], [new])
+-            if any(orig.count(o) != 1 for o in olds):
++            orig = mutate(src, fname, old, new)
++            if orig is None:
+                 print(f'{mid}: mutation site not found exactly once in {fname}')
+                 failures += 1
+                 continue
+-            mutated = orig
+-            for o, n in zip(olds, news):
+-                mutated = mutated.replace(o, n)
+-            open(path, 'w').write(mutated)
+             ok, summary, out = verify(src)
+             open(path, 'w').write(orig)
+             if ok:
+@@ -152,5 +227,57 @@
+     sys.exit(1 if failures else 0)
+ 
+ 
++def first_pass():
++    """The gaps of Claude's first pass: M23-M27 verify there, and the calls of gap_clients.rs fail."""
++    failures = 0
++    with tempfile.TemporaryDirectory() as tmp:
++        work = os.path.join(tmp, 'crate')
++        shutil.copytree(FIRST_PASS, work, ignore=shutil.ignore_patterns('target', 'verification', '.verus-*'))
++        src = os.path.join(work, 'src')
++        ok, summary, _ = verify(src)
++        print(f'first pass ({FIRST_PASS}): {"verifies" if ok else "FAILS"} ({summary.strip()})')
++        if not ok:
++            sys.exit(1)
++        for mid, desc, fname, old, new in MUTANTS:
++            if mid not in GAP:
++                continue
++            path = os.path.join(src, fname)
++            orig = mutate(src, fname, old, new)
++            if orig is None:
++                print(f'{mid}: mutation site not found exactly once in {fname}')
++                failures += 1
++                continue
++            ok, summary, out = verify(src)
++            open(path, 'w').write(orig)
++            if ok:
++                print(f'{mid}: verifies on the first pass (as expected)  {desc}')
++            else:
++                failures += 1
++                first = next((l for l in out.splitlines() if l.startswith('error')), '?')
++                print(f'{mid}: REJECTED by the first pass  {desc}  [{first}]')
++        # gap_clients.rs against the first pass: each of its 4 calls must fail
++        lib = os.path.join(tmp, 'librand_core.rlib')
++        vir = os.path.join(tmp, 'rand_core.vir')
++        subprocess.run([VERUS, '--crate-type=lib', '--edition=2024', '--crate-name', 'rand_core',
++                        os.path.join(src, 'lib.rs'), '--export', vir, '--compile', '-o', lib],
++                       capture_output=True, text=True, cwd=work)
++        r = subprocess.run([VERUS, '--edition=2024', os.path.join(HERE, 'gap_clients.rs'), '-o',
++                            os.path.join(tmp, 'gap_clients'), '--extern', f'rand_core={lib}',
++                            '--import', f'rand_core={vir}'], capture_output=True, text=True, cwd=work)
++        out = r.stdout + r.stderr
++        lines = [int(m.group(1)) for m in re.finditer(r'gap_clients\.rs:(\d+):', out)]
++        text = open(os.path.join(HERE, 'gap_clients.rs')).read().split('\n')
++        fns = sorted({next(l.split('fn ')[1].split('<')[0].split('(')[0] for l in reversed(text[:n])
++                           if l.startswith('fn ')) for n in lines})
++        expected = ['gap_fill_bytes_len', 'gap_re', 'gap_reconstruct_empty_block', 'gap_reset_clone']
++        summary = next((l for l in out.splitlines() if 'verification results' in l), '?')
++        print(f'gap_clients.rs against the first pass: errors in {fns} ({summary.strip()})')
++        if fns != expected:
++            failures += 1
++            print(f'  expected errors in exactly {expected}')
++    print(f'first pass: {failures} unexpected results')
++    sys.exit(1 if failures else 0)
++
++
+ if __name__ == '__main__':
+-    main()
++    first_pass() if sys.argv[1:] == ['--first-pass'] else main()
+diff -ruN '--exclude=target' '--exclude=Cargo.lock' '--exclude=.verus-log' '--exclude=.verus-solver-log' '--exclude=__pycache__' '--exclude=amendments.diff' '--exclude=VERIFICATION.md' '--exclude=SPEC_REVIEW.md' verus/verification/verify.sh verus_fixed/verification/verify.sh
+--- verus/verification/verify.sh	2026-11-18 19:27:51.394339330 -0500
++++ verus_fixed/verification/verify.sh	2026-11-23 05:58:19.477452845 -0500
+@@ -1,8 +1,10 @@
+ #!/usr/bin/env bash
+-# Verify the annotated crate, then the verified client of its specifications.
++# Verify the annotated crate, then the verified clients of its specifications: the examples, the
++# two refinement checks (the developer's contracts, and Claude's first-pass contracts, each
++# implemented by calling the crate), and the calls that only the fixed contracts allow.
+ #
+-# Usage (from anywhere): verus/verification/verify.sh
+-# Needs `verus` on PATH, or VERUS=/path/to/verus. Extra arguments are passed to both Verus runs
++# Usage (from anywhere): verus_fixed/verification/verify.sh
++# Needs `verus` on PATH, or VERUS=/path/to/verus. Extra arguments are passed to every Verus run
+ # (e.g. `--smt-option smt.random_seed=7`).
+ set -euo pipefail
+ here="$(cd "$(dirname "$0")" && pwd)"
+@@ -15,6 +17,8 @@
+ "$verus" --crate-type=lib --edition=2024 --crate-name rand_core "$crate/src/lib.rs" \
+     --export "$out/rand_core.vir" --compile -o "$out/librand_core.rlib" "$@"
+ 
+-echo "== verified client (verification/client_examples.rs)"
+-"$verus" --edition=2024 "$here/client_examples.rs" -o "$out/client_examples" \
+-    --extern rand_core="$out/librand_core.rlib" --import rand_core="$out/rand_core.vir" "$@"
++for client in client_examples human_spec_client claude_spec_client gap_clients; do
++    echo "== verified client (verification/$client.rs)"
++    "$verus" --edition=2024 "$here/$client.rs" -o "$out/$client" \
++        --extern rand_core="$out/librand_core.rlib" --import rand_core="$out/rand_core.vir" "$@"
++done
