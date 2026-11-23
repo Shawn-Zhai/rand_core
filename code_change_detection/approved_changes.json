@@ -1,0 +1,330 @@
+[
+  {
+    "key": "imports",
+    "status": "changed",
+    "fingerprint": "3dda0d2553136009",
+    "agent_note": "Every module imports `vstd::prelude::*` (the `verus!` macro, and the names that the specifications use). `use core::fmt` moved from `block` to `trusted` with the `Debug` impl; `trusted` imports what that impl and its other items need; `unwrap_err` imports `panic_msg` from `trusted`, where it moved. The glob import cannot change which items the executable code uses: the release build's MIR is byte-identical when each `use vstd::prelude::*;` is replaced by `use vstd::prelude::verus;` (checked on 2026-11-23 with rustc 1.100.0: `cargo rustc --release --lib -- --emit=mir`).",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn check_read_words_len",
+    "status": "added",
+    "fingerprint": "177ab8a04f378882",
+    "agent_note": "Trusted wrapper C4 (`trusted.rs`): upstream's `assert_eq!(size_of_val(src), size_of::<[W; N]>())` from `read_words`, verbatim (`check_trusted.py` checks it), in a `#[track_caller] #[inline(always)]` function. Verus does not support panics, so its trusted contract `requires src.len() == N * size_of::<W>()` makes every verified caller establish the condition; that this is upstream's condition is the array layout `size_of::<[W; N]>() == N * size_of::<W>()` (Rust Reference, 'Type layout'; vstd does not state it). Unverified callers get upstream's check and message, reported (`#[track_caller]`) at the call in `read_words`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn check_skip",
+    "status": "added",
+    "fingerprint": "3b90863304c7abe1",
+    "agent_note": "Trusted wrapper C3 (`trusted.rs`): upstream's `assert!(n < N)` from `reset_and_skip`, verbatim (`check_trusted.py` checks it), in a `#[track_caller] #[inline(always)]` function. Its trusted contract `requires n < N` is the asserted condition, so the assertion cannot fail in verified callers; unverified callers get upstream's check, with the same message ('assertion failed: n < N').",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn fill_bytes_via_next_word",
+    "status": "changed",
+    "fingerprint": "a0096822e6d477f1",
+    "agent_note": "Upstream's `dst.chunks_exact_mut(size)` loop and `into_remainder()` are rewritten as an index loop, and `[..rem.len()]` as `[0..rem.len()]` (the same slice): Verus supports neither these iterators nor `RangeTo` indexing. Same behaviour: the loop runs while at least `size` bytes are left, that is `len / size` times, once per chunk; each iteration calls `next_word()?` once and copies its little-endian bytes to `dst[pos..pos + size]`, the same chunk in the same order (upstream takes the chunk before calling `next_word`, which has no effect); the remainder is `dst[pos..]` with `pos = (len / size) * size`, which is `into_remainder()`, and `next_word` is called once more only if it is non-empty. `dst.len() - pos` cannot underflow (`pos <= len`, proved). Evidence: the differential test (`verus_fixed/verification/differential/`): equal `dst`, result and number of `next_word` calls for every length 0 to 41 with `next_word` failing at each call or never, for `u32` and `u64`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn next_word_via_fill",
+    "status": "changed",
+    "fingerprint": "b3902eebe4be0d68",
+    "agent_note": "`buf.as_mut()` became `W::bytes_as_mut(&mut buf)`, a method added to the private `Sealed` trait whose body, for both `u32` and `u64`, is `bytes.as_mut()` (`#[inline(always)]`): the same call. Reason: Verus cannot give `AsMut::as_mut` a contract on a generic `W::Bytes`; the per-type method has one (the slice is the array). Evidence: the differential test (`verus_fixed/verification/differential/`): equal results and identical `try_fill_bytes` calls (same buffer lengths), for `u32` and `u64`, with and without errors.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn panic_msg",
+    "status": "changed",
+    "fingerprint": "4763ec5ae5d44dd3",
+    "agent_note": "Moved unchanged from `unwrap_err.rs` to `trusted.rs` (item C2) and made `pub(crate)`, so that `unwrap_err.rs` can still call it (`use crate::trusted::panic_msg`); it stays private to the crate. The body, the formatted `panic!`, is verbatim (`check_trusted.py` checks it). It is trusted (`external_body`, see that trust marker) because Verus supports neither formatting nor panics; its Verus contract, `ensures false` (it never returns), is erased in this build. Evidence: the differential test (`verus_fixed/verification/differential/`): `UnwrapErr` panics with the same message.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn pcg32",
+    "status": "changed",
+    "fingerprint": "2580c1de0b1d02a0",
+    "agent_note": "`x.to_le_bytes()` became `crate::trusted::u32_to_le_bytes(x)`, an `#[inline(always)]` wrapper whose body is `x.to_le_bytes()` (item C5; `check_trusted.py` checks the body): the same call. Reason: vstd does not specify `u32::to_le_bytes`, whose return type `[u8; size_of::<Self>()]` cannot take an `assume_specification`, so the wrapper carries the little-endian contract. Evidence: upstream's value test `test_seed_from_u64` passes, and the Verus lemma `lemma_pcg32_test_vector` checks the contract against it; the differential test (`verus_fixed/verification/differential/`): `seed_from_u64` writes the same seed for 16 seed lengths (0 to 64 bytes), 300 states each.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn read_words",
+    "status": "changed",
+    "fingerprint": "481cccef3bf89195",
+    "agent_note": "Three changes. (1) Upstream's `assert_eq!(size_of_val(src), size_of::<[W; N]>())` moved verbatim into `crate::trusted::check_read_words_len::<W, N>(src)` (item C4, `#[track_caller] #[inline(always)]`): the same check, in every build, with the same message, reported at the call in `read_words`. The report's hint `debug_assert*! removed` is a false positive: the removed lines are this `assert_eq!`. (2) The `dst.iter_mut().zip(src.chunks_exact(size))` loop is an index loop over `i` in `0..N` that reads `src[i * size..(i + 1) * size]`: after the assertion `src` has exactly `N` chunks, so the same chunks are read in the same order; the indexing cannot fail or overflow (`(i + 1) * size <= N * size == src.len()`, proved). (3) `buf.as_mut()` became `W::bytes_as_mut(&mut buf)`, whose body is `bytes.as_mut()`. Evidence: the differential test (`verus_fixed/verification/differential/`): equal words, or equal panic messages, for every length from 0 to `N * size + 2`, with `N` = 0, 1, 2, 3, 8, for `u32` and `u64`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn u32_from_le_bytes",
+    "status": "added",
+    "fingerprint": "a49d9b80f2519cec",
+    "agent_note": "Trusted wrapper C5 (`trusted.rs`): `u32::from_le_bytes(b)`, `#[inline(always)]`, with the contract `r == u32_from_le(b@)`, an explicit little-endian formula. `check_trusted.py` checks that the body is exactly this call. Called by `Sealed::from_le_bytes` for `u32`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn u32_to_le_bytes",
+    "status": "added",
+    "fingerprint": "0892bdf2c5c5bcaf",
+    "agent_note": "Trusted wrapper C5 (`trusted.rs`): `x.to_le_bytes()`, `#[inline(always)]`, with the contract `r@ == u32_le_bytes(x)`, the explicit little-endian bytes. `check_trusted.py` checks that the body is exactly this call. Called by `Sealed::to_le_bytes` for `u32` and by `pcg32`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn u64_from_le_bytes",
+    "status": "added",
+    "fingerprint": "5385ebef62bc7187",
+    "agent_note": "Trusted wrapper C5 (`trusted.rs`): `u64::from_le_bytes(b)`, `#[inline(always)]`, with the contract `r == u64_from_le(b@)`, an explicit little-endian formula. `check_trusted.py` checks that the body is exactly this call. Called by `Sealed::from_le_bytes` for `u64`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "fn u64_to_le_bytes",
+    "status": "added",
+    "fingerprint": "91a7e7e1ecaa2428",
+    "agent_note": "Trusted wrapper C5 (`trusted.rs`): `x.to_le_bytes()`, `#[inline(always)]`, with the contract `r@ == u64_le_bytes(x)`, the explicit little-endian bytes. `check_trusted.py` checks that the body is exactly this call. Called by `Sealed::to_le_bytes` for `u64`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl BlockRng :: fn fill_bytes",
+    "status": "changed",
+    "fingerprint": "7500066dd4e03197",
+    "agent_note": "The zip of `dest[read_len..].chunks_exact_mut(size)` with `self.results[index..].iter()` is rewritten as an explicit loop: Verus supports none of these iterators. `num_chunks = min((dest.len() - read_len) / size, N - index)` is what `zipped.len()` returns, and the loop copies chunk `i` from `results[index + i]`, as `for_each` does. `if let Some(src) = src.next()` became `if index < N` after `index += num_chunks`: the same condition, and `src` is `results[index]`. `chunks.into_remainder()` became `dest[read_len..]` (via `split_at_mut`), and `[..n]` became `[0..n]`: the same slices, because in that branch the words did not run out first, so `num_chunks` was the number of full chunks and `dest[read_len..]` is exactly the remainder. Upstream's `debug_assert_eq!(read_len + n, dest.len())` is removed; it holds in every state in both versions, and Verus proves it. Evidence: the differential test (`verus_fixed/verification/differential/`), random sequences of all `BlockRng` operations (`u32` words with N = 1, 2, 3, 4, 16; `u64` words with N = 1, 5, 8; up to 3 blocks and 4 bytes per call): the same bytes written and the same states, in debug and release builds.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl BlockRng :: fn reconstruct",
+    "status": "changed",
+    "fingerprint": "216fb22242603e0e",
+    "agent_note": "`results[index..].copy_from_slice(remaining_results)` became `results.split_at_mut(index).1.copy_from_slice(remaining_results)`: the same subslice `results[index..N]` (Verus does not support `[index..]` on a mutable array). `index = N - remaining_results.len() <= N`, so `split_at_mut` cannot panic, and the lengths are equal, as before. Evidence: the differential test (`verus_fixed/verification/differential/`): the same `Some`/`None` and the same state, for round trips through `remaining_results`, slices of every length from 0 to `N + 1`, and `N == 0`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl BlockRng :: fn remaining_results",
+    "status": "changed",
+    "fingerprint": "9ae8d737d9114ebb",
+    "agent_note": "`&self.results[index..]` became `&self.results[index..N]`, the same slice (`results` has length `N`): Verus does not support `RangeFrom` indexing. The panics are the same too: an index above `N` (possible only after a caught panic between `generate` and `set_index`; see `set_index`) panics in both, with the same message on rustc 1.100 ('range start index ... out of range for slice of length N'), checked by the differential test (`verus_fixed/verification/differential/`).",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl BlockRng :: fn reset_and_skip",
+    "status": "changed",
+    "fingerprint": "d2d0043cd5549a5c",
+    "agent_note": "Upstream's `assert!(n < N)` moved verbatim into `crate::trusted::check_skip::<N>(n)` (item C3, `#[track_caller] #[inline(always)]`). Verus does not support panics, so the assertion is in a trusted function whose precondition is the asserted condition: verified callers must prove it, unverified callers get upstream's check. Same check in every build, still before `generate`, same message ('assertion failed: n < N'), reported at the call in `reset_and_skip`. Evidence: the differential test (`verus_fixed/verification/differential/`), `n` from 0 to `N + 1`: the same results, states and panic messages.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl BlockRng :: fn set_index",
+    "status": "changed",
+    "fingerprint": "2fd4a5e2630ba032",
+    "agent_note": "Upstream's `debug_assert!(0 < index && index <= N)` is removed. Verus proves it at every call: `set_index` requires `0 < index <= N`, and each caller establishes that from its precondition `wf()`. So in every state that `new`, `reconstruct` and the methods produce, it cannot fire. One difference remains, in debug builds only: after a caught panic between `generate` and `set_index` (e.g. `next_u64_from_u32` with `N == 1`, which panics there on every call, or a panicking `Generator::generate`), the word stored as the index is a generated word; `fill_bytes(&mut [])` then stores it back, and upstream's `debug_assert!` panics where this crate does not (in release builds neither panics). The differential test (`verus_fixed/verification/differential/`) finds exactly this difference and no other.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl Sealed for u32 :: fn bytes_as_mut",
+    "status": "added",
+    "fingerprint": "d5e9f69548417097",
+    "agent_note": "The implementation of the new `Sealed::bytes_as_mut` for `u32` (see `trait Sealed`): `bytes.as_mut()` on `[u8; 4]`, `#[inline(always)]`, which returns the whole array as a slice (std's `impl AsMut<[T]> for [T; N]`).",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl Sealed for u32 :: fn from_le_bytes",
+    "status": "changed",
+    "fingerprint": "f88cc1772296dbcf",
+    "agent_note": "`Self::from_le_bytes(bytes)`, the inherent `u32::from_le_bytes`, became `crate::trusted::u32_from_le_bytes(bytes)`, an `#[inline(always)]` wrapper whose body is `u32::from_le_bytes(b)` (item C5; `check_trusted.py` checks the body): the same call. Reason: the wrapper carries the explicit little-endian contract that the proofs use. Evidence: the differential test (`verus_fixed/verification/differential/`): `read_words` and `next_word_via_fill` return the same words.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl Sealed for u32 :: fn to_le_bytes",
+    "status": "changed",
+    "fingerprint": "48127a957fa8a99f",
+    "agent_note": "`Self::to_le_bytes(self)` became `crate::trusted::u32_to_le_bytes(self)`, an `#[inline(always)]` wrapper whose body is `x.to_le_bytes()` (item C5; `check_trusted.py` checks the body): the same call. vstd does not specify `to_le_bytes` (its return type `[u8; size_of::<Self>()]` cannot take an `assume_specification`), so the wrapper carries the little-endian contract. Evidence: the PCG32 test vector (Verus), and the differential test (`verus_fixed/verification/differential/`) (`fill_bytes`, `fill_bytes_via_next_word`).",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl Sealed for u64 :: fn bytes_as_mut",
+    "status": "added",
+    "fingerprint": "d5e9f69548417097",
+    "agent_note": "The implementation of the new `Sealed::bytes_as_mut` for `u64` (see `trait Sealed`): `bytes.as_mut()` on `[u8; 8]`, `#[inline(always)]`, which returns the whole array as a slice. It has the same fingerprint as the `u32` one because the code is identical.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl Sealed for u64 :: fn from_le_bytes",
+    "status": "changed",
+    "fingerprint": "c90f9dd8f56aeaec",
+    "agent_note": "As for `u32`: `Self::from_le_bytes(bytes)` became `crate::trusted::u64_from_le_bytes(bytes)`, an `#[inline(always)]` wrapper whose body is `u64::from_le_bytes(b)` (item C5; `check_trusted.py` checks the body): the same call, with an explicit little-endian contract. Evidence: the differential test (`verus_fixed/verification/differential/`): `read_words::<u64, _>` and `next_word_via_fill::<u64, _>` return the same words.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "impl Sealed for u64 :: fn to_le_bytes",
+    "status": "changed",
+    "fingerprint": "b7d0b9976d7f2324",
+    "agent_note": "As for `u32`: `Self::to_le_bytes(self)` became `crate::trusted::u64_to_le_bytes(self)`, an `#[inline(always)]` wrapper whose body is `x.to_le_bytes()` (item C5; `check_trusted.py` checks the body): the same call, with an explicit little-endian contract. Evidence: the differential test (`verus_fixed/verification/differential/`): `fill_bytes` on `u64` blocks and `fill_bytes_via_next_word` with `u64` words write the same bytes.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trait Sealed",
+    "status": "changed",
+    "fingerprint": "ae74a32c41439012",
+    "agent_note": "One method added to the private sealed trait: `bytes_as_mut(bytes: &mut Self::Bytes) -> &mut [u8]`, implemented for `u32` and `u64` as `bytes.as_mut()`. Generic code (`next_word_via_fill`, `read_words`) calls it instead of `AsMut::as_mut`, because Verus cannot give `AsMut::as_mut` a contract on a generic `Self::Bytes`. The trait still cannot be implemented outside the crate, but, like its existing methods (`from_usize` and others), `bytes_as_mut` can be called by downstream code through a `W: Word` bound (checked on 2026-11-23), so it slightly enlarges what downstream code can call. It is `as_mut()`, so it gives no new capability.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trait SeedableRng",
+    "status": "changed",
+    "fingerprint": "f39b4331a26493d0",
+    "agent_note": "Only `seed_from_u64`'s body changed. Its `seed.as_mut().chunks_exact_mut(4)` loop is an index loop (Verus supports neither the iterator nor `into_remainder`): `seed.as_mut()` is still called once; the loop runs while 4 bytes are left and writes `pcg32(&mut state)` to `dst[pos..pos + 4]`, one `pcg32` call per full chunk, in order, as upstream; the remainder `dst[pos..]` gets the first bytes of one more `pcg32` call if it is non-empty (`[..n]` became `[0..n]`). The many `#[doc]` lines shown as added are the trait items' existing documentation, unchanged: every upstream doc line of `seedable_rng.rs` is in the annotated file, in order, and the script compares documentation separately. Evidence: upstream's value test `test_seed_from_u64` passes; the differential test (`verus_fixed/verification/differential/`): the same seed for seed lengths 0-5, 7, 8, 9, 12, 16, 31, 32, 33, 40 and 64 bytes, 300 states each.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "file Cargo.toml",
+    "status": "changed",
+    "fingerprint": "3afe29e52c9567b0",
+    "agent_note": "Build changes, visible to anyone who builds this crate. (1) `rust-version` 1.85 -> 1.100: the new dependency `vstd` needs the toolchain that Verus is built with. (2) The dependency `vstd = \"=0.0.0-2026-11-22-0344\"` (`default-features = false`), only for the `verus!` macro, which erases the specifications and proofs in a normal build. Upstream has no dependencies; this adds `vstd`, `verus_builtin` and the proc-macro crate `verus_builtin_macros` (with `syn`, `quote`, `proc-macro2` and others at build time). The executable code uses nothing else from `vstd` (see `imports`). (3) `publish = false`, so that the annotated copy cannot be published by mistake. (4) The `unexpected_cfgs` lint declares the cfgs `verus_keep_ghost` and `verus_only`, which Verus builds set, so that rustc does not warn about them. Because of (1), not suitable to upstream as is.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "file rust-toolchain.toml",
+    "status": "added",
+    "fingerprint": "1601324da25b5b70",
+    "agent_note": "New file: pins rustc 1.100.0, the toolchain that Verus 0.2026.11.22 is built with and that the `vstd` dependency needs (see `Cargo.toml`). It affects only builds run in this folder.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/block.rs: #[cfg(verus_keep_ghost)] use vstd::std_specs::convert::TryFromSpec;",
+    "status": "trust marker",
+    "fingerprint": "ccf0fd7e3d0e5426",
+    "agent_note": "Added on 2026-11-23 in the review against the developer's spec. Verus builds only (`#[cfg(verus_keep_ghost)]`): imports `TryFromSpec`, the trait of `try_from_spec` (vstd's specification of `TryFrom::try_from`), which the developer's clauses use to state the index. A normal build has neither the import nor the ghost code that uses it; the trait has only spec functions, so it cannot change which exec method a call resolves to. It makes no code trusted (it is listed because it mentions `verus_keep_ghost`). `check_trusted.py` allows that attribute outside `trusted.rs` only on this exact import.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/lib.rs: #![cfg_attr(verus_keep_ghost, feature(sized_hierarchy))]",
+    "status": "trust marker",
+    "fingerprint": "bd69b4922958a408",
+    "agent_note": "Verus builds only: enables the unstable `sized_hierarchy` feature, because the specifications in `trusted.rs` (S3, S4) name `core::marker::PointeeSized`. No effect on normal builds, and it makes no code trusted (it is listed because it mentions `verus_keep_ghost`). `check_trusted.py` allows this exact line.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[cfg(verus_keep_ghost)] pub mod std_specs {",
+    "status": "trust marker",
+    "fingerprint": "973390e0c3c7b071",
+    "agent_note": "The module of the specifications S1, S3 and S4, compiled only in Verus builds (like vstd's own `std_specs`). S1 declares `core::error::Error` to Verus with its supertraits (`Debug + Display`), so that `TryRng::Error` can be bounded by it; S3 and S4 declare `AsRef` and `AsMut` and specify `as_ref`/`as_mut` on arrays (separate trust markers). No executable code. Trusted: each states what std's own trait or impl says.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: pub assume_specification<T, const N: usize>[ <[T; N] as AsRef<[T]>>::as_ref ](a: &[T; N]) -> (r: &[T]);",
+    "status": "trust marker",
+    "fingerprint": "ff40d54e087c8bdb",
+    "agent_note": "S3: `as_ref` on an array returns the array's elements as a slice (`r@ == a@`, stated through the trait's `as_ref_rel`), as std's `impl<T, const N: usize> AsRef<[T]> for [T; N]` does (it returns `self`). Used where the bytes of `to_le_bytes(..).as_ref()` are copied.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: pub assume_specification<T, const N: usize>[ <[T; N] as AsMut<[T]>>::as_mut ](a: &mut [T; N]) -> (r: &mut [T])",
+    "status": "trust marker",
+    "fingerprint": "ae6ed6ae28f40a20",
+    "agent_note": "S4: `as_mut` on an array returns the array as a slice: `r@ == old(a)@`, and the array ends as the slice does (`final(a)@ == final(r)@`), so writes through the slice are writes to the array. This is std's `impl<T, const N: usize> AsMut<[T]> for [T; N]` (it returns `self`). Used by `bytes_as_mut`.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[verifier::external_body] pub(crate) fn panic_msg(err: impl core::error::Error) -> (r: Infallible)",
+    "status": "trust marker",
+    "fingerprint": "a4b07ce74ea50b57",
+    "agent_note": "C2 (see `fn panic_msg`): upstream's code, verbatim (`check_trusted.py`), trusted because Verus supports neither formatted strings nor panics. Its contract, `ensures false`, says that it never returns, which `panic!` guarantees. Verus warns 'unreachable call' at that `ensures` (code that rustc sees after the `panic!`): harmless.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[verifier::external_body] pub(crate) fn check_skip<const N: usize>(n: usize)",
+    "status": "trust marker",
+    "fingerprint": "05fbb251bf2faede",
+    "agent_note": "C3 (see `fn check_skip`): trusted because Verus does not support panics. Nothing is trusted beyond std's `assert!`: the precondition is the asserted condition itself, so the body cannot panic for a verified caller.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[verifier::external_body] pub(crate) fn check_read_words_len<W, const N: usize>(src: &[u8])",
+    "status": "trust marker",
+    "fingerprint": "3e5b3e83cc2e04e5",
+    "agent_note": "C4 (see `fn check_read_words_len`): trusted because Verus does not support panics. What is trusted: that its precondition `src.len() == N * size_of::<W>()` implies the asserted `size_of_val(src) == size_of::<[W; N]>()`, i.e. the array layout of the Rust Reference, which vstd does not state.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[verifier::external_body] pub(crate) fn u32_to_le_bytes(x: u32) -> (r: [u8; 4])",
+    "status": "trust marker",
+    "fingerprint": "c42dcc311464d2ea",
+    "agent_note": "C5 (see `fn u32_to_le_bytes`): what is trusted is the little-endian contract `r@ == u32_le_bytes(x)` of the std call in the body. Checked by `check_trusted.py` (the body is `x.to_le_bytes()`), by the PCG32 test vector in Verus (negative control M22, a big-endian contract, is rejected), by upstream's tests and by the differential test (`verus_fixed/verification/differential/`).",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[verifier::external_body] pub(crate) fn u32_from_le_bytes(b: [u8; 4]) -> (r: u32)",
+    "status": "trust marker",
+    "fingerprint": "3539428d0d211104",
+    "agent_note": "C5 (see `fn u32_from_le_bytes`): what is trusted is the little-endian contract `r == u32_from_le(b@)` of the std call in the body. Checked by `check_trusted.py` (the body is `u32::from_le_bytes(b)`), by upstream's tests and by the differential test (`verus_fixed/verification/differential/`); `u32_from_le` is the formula of vstd's own definition (S7), and the round trip with the `to_le_bytes` contract is proved in `word.rs`. As Claude's port notes say, vstd now specifies `u32::from_le_bytes` itself, so this wrapper could be replaced by vstd's specification (with S7).",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[verifier::external_body] pub(crate) fn u64_to_le_bytes(x: u64) -> (r: [u8; 8])",
+    "status": "trust marker",
+    "fingerprint": "ee3b2e3e5124897f",
+    "agent_note": "C5 (see `fn u64_to_le_bytes`): what is trusted is the little-endian contract `r@ == u64_le_bytes(x)` of the std call in the body. Checked by `check_trusted.py` (the body is `x.to_le_bytes()`), by upstream's tests and by the differential test (`verus_fixed/verification/differential/`). (vstd defines the same bytes, `spec_u64_to_le_bytes_open`, but does not specify `u64::to_le_bytes`.)",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: #[verifier::external_body] pub(crate) fn u64_from_le_bytes(b: [u8; 8]) -> (r: u64)",
+    "status": "trust marker",
+    "fingerprint": "3c0ea6a332e3bfd3",
+    "agent_note": "C5 (see `fn u64_from_le_bytes`): what is trusted is the little-endian contract `r == u64_from_le(b@)` of the std call in the body. Checked by `check_trusted.py` (the body is `u64::from_le_bytes(b)`), by upstream's tests and by the differential test (`verus_fixed/verification/differential/`). As Claude's port notes say, vstd now specifies `u64::from_le_bytes` itself, so this wrapper could be replaced by vstd's specification.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/trusted.rs: pub axiom fn axiom_spec_u32_from_le_bytes(s: Seq<u8>)",
+    "status": "trust marker",
+    "fingerprint": "119b9a66e7bdcbd1",
+    "agent_note": "S7, added on 2026-11-23 in the review against the developer's spec. It states the definition of vstd's `spec_u32_from_le_bytes`, verbatim: vstd declares that function `closed`, so outside vstd nothing can relate it to the little-endian encoding, and the developer's spec defines `u32::spec_from_le_bytes` with it (vstd exports the `u64` counterpart as a lemma, so `u64` needs no axiom). `check_trusted.py` compares the expression with vstd's source at the version in `Cargo.toml`, and fails if they differ. Ghost only: no executable code.",
+    "reviewer": "Shawn",
+    "note": ""
+  },
+  {
+    "key": "trust src/word.rs: #[cfg(verus_keep_ghost)] use vstd::std_specs::convert::TryFromSpec;",
+    "status": "trust marker",
+    "fingerprint": "2273ab00e44f020d",
+    "agent_note": "Added on 2026-11-23 in the review; the same import as in `block.rs` (see that trust marker). `word.rs` has it twice, at the top level (for `lemma_try_from_usize_spec`) and in `mod sealed` (for `Sealed::lemma_try_from_usize`); this one finding covers both lines. Verus builds only; it makes no code trusted; `check_trusted.py` allows only this exact import.",
+    "reviewer": "Shawn",
+    "note": ""
+  }
+]
