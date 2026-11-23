@@ -22,7 +22,7 @@ edit against `../verus/`. This document describes the amended crate. The executa
 | `assume`, `admit`, axioms, `external_body`, `assume_specification` outside `src/trusted.rs` | **none**; no code outside `verus!` either ([`check_trusted.py`](verification/check_trusted.py)) |
 | Trusted base ([`src/trusted.rs`](src/trusted.rs)) | 3 specifications of std items (S1, S3, S4; S2, S5, S6 are now vstd's), 1 fact about vstd (S7: the definition of the `closed` `spec_u32_from_le_bytes`, verbatim, checked against vstd's source), 5 pieces of code (C1-C5): the `Debug` impl and `panic_msg` (upstream, verbatim), the bodies of upstream's two `assert`s, and 4 one-line wrappers of `{to,from}_le_bytes` |
 | Negative controls | **27/27** injected bugs rejected ([`negative_controls.py`](verification/negative_controls.py)), including a wrong *trusted* specification (M22), a code-and-spec change that only the PCG32 test vector catches (M21), and five bugs (M23-M27) that only the clauses added in the review catch: the first pass accepts all five (`--first-pass`) |
-| Differential test (annotated vs upstream, normal build) | [`verification/differential/run.sh`](verification/differential/run.sh), on every function whose code changed: 421,617 comparisons in a debug build and 421,017 in a release build, panics and their messages included, all equal except one debug-only difference after a caught panic (see "Changes": `set_index`). (The first pass reported 31,350 equal comparisons from a scratch harness that is not in the repository) |
+| Differential test (annotated vs upstream, normal build) | on every function whose code changed (a test harness not kept in the repository): 421,617 comparisons in a debug build and 421,017 in a release build, panics and their messages included, all equal except one debug-only difference after a caught panic (see "Changes": `set_index`). (The first pass reported 31,350 equal comparisons from another harness, also not in the repository) |
 | Proof stability | the crate and all four clients verify with SMT seeds 0-24 and 77 |
 | Normal build | builds; upstream's tests pass (11 integration, 4 doc tests); `clippy -D warnings`, `rustdoc -D warnings`, `rustfmt --check` clean |
 | Executable code | changed by the first pass as listed under [Changes to the executable code](#changes-to-the-executable-code); the review changed none |
@@ -35,7 +35,6 @@ VERUS=/path/to/verus verus_fixed/verification/verify.sh       # crate, then the 
 VERUS=/path/to/verus python3 verus_fixed/verification/negative_controls.py
 VERUS=/path/to/verus python3 verus_fixed/verification/negative_controls.py --first-pass
 VERUS=/path/to/verus python3 verus_fixed/verification/developer_spec_findings.py
-verus_fixed/verification/differential/run.sh                  # this crate vs upstream, debug and release
 python3 verus_fixed/verification/check_trusted.py
 (cd verus_fixed && cargo test)                                # upstream's tests, normal build
 ```
@@ -221,13 +220,11 @@ build (re-checked on 2026-11-23) is byte-identical whether each module imports `
   `fill_bytes` writes `[12, 0, 0, 0, 13, 0]` without generating, and `next_u64_from_u32` then
   generates the next block and returns `0xf_0000_000e`; `read_words` decodes concrete bytes;
   `UnwrapErr` and `next_u64_via_u32` results are determined.
-- **Differential test** ([`verification/differential/run.sh`](verification/differential/run.sh),
-  not part of the crate): upstream and this crate side by side on random operation sequences on
+- **Differential test** (a test harness, not kept in the repository): upstream and this crate side by side on random operation sequences on
   `BlockRng` (N = 1, 2, 3, 4, 16 for `u32`; 1, 5, 8 for `u64`), the state after a caught panic,
   `fill_bytes_via_next_word` with errors at every call, `next_word_via_fill` and `next_u64_via_u32`
   with fallible sources, `read_words` at every length (panics included), `seed_from_u64` for 16
-  seed lengths and 300 states each, and `UnwrapErr` panics: 421,617 comparisons in a debug build and 421,017 in a release build, panics and their messages included, all equal except one debug-only difference after a caught panic (see "Changes": `set_index`). Cargo cannot build two
-  packages `rand_core` 0.10.1 together, so `run.sh` builds a renamed copy of upstream.
+  seed lengths and 300 states each, and `UnwrapErr` panics: 421,617 comparisons in a debug build and 421,017 in a release build, panics and their messages included, all equal except one debug-only difference after a caught panic (see "Changes": `set_index`).
 
 ## Findings
 

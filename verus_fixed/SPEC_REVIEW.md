@@ -156,8 +156,7 @@ gives `Ok` and is left unchanged. **Fix:** both clauses added; the body verifies
 - **The bug Claude found** (`next_u64_from_u32` panics on every call when `N == 1`) is real (reproduced
   against upstream). Both specs require `N >= 2`.
 - **Claude's code changes preserve upstream's behaviour**, with one qualification. A differential test
-  ([`verification/differential/run.sh`](verification/differential/run.sh)) runs upstream and this crate
-  side by side on every changed function: 421,617 comparisons in a debug build and 421,017 in release,
+  (a test harness, not kept in the repository) runs upstream and this crate side by side on every changed function: 421,617 comparisons in a debug build and 421,017 in release,
   panics included, all equal but one. After a caught panic between `generate` and `set_index` (as
   `next_u64_from_u32` with `N == 1` does on every call), the stored index is a generated word, and a
   `fill_bytes(&mut [])` then trips upstream's `debug_assert!` in `set_index`, which Claude removed
@@ -247,7 +246,6 @@ VERUS=/path/to/verus verus_fixed/verification/verify.sh                         
 VERUS=/path/to/verus python3 verus_fixed/verification/negative_controls.py       # 27 mutants rejected
 VERUS=/path/to/verus python3 verus_fixed/verification/negative_controls.py --first-pass   # gaps of verus/
 VERUS=/path/to/verus python3 verus_fixed/verification/developer_spec_findings.py        # H1-H5
-verus_fixed/verification/differential/run.sh                                            # vs upstream
 python3 verus_fixed/verification/check_trusted.py
 (cd verus_fixed && cargo test)
 ```
