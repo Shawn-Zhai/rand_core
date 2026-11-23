@@ -230,7 +230,7 @@ pub open spec fn pcg32_step(state: u64) -> u64 {
 
 /// (ghost) The PCG32 output function ("XSH RR") applied to the state `state`.
 pub open spec fn pcg32_output(state: u64) -> u32 {
-    crate::trusted::std_specs::u32_rotate_right(
+    vstd::wrapping::u32_specs::rotate_right(
         (((state >> 18u64) ^ state) >> 27u64) as u32,
         (state >> 59u64) as u32,
     )
@@ -288,7 +288,7 @@ fn pcg32(state: &mut u64) -> (r: [u8; 4])
 /// Upstream's value test (`test_seed_from_u64` in `tests/mod.rs`): from state 0, the 8-byte
 /// seed that `seed_from_u64` writes (two PCG32 outputs) is the little-endian encoding of
 /// `5029875928683246316`. This checks the specification, including the trusted specifications
-/// of `rotate_right` and `to_le_bytes`, against upstream's test vector.
+/// of `rotate_right` (vstd's) and `to_le_bytes`, against upstream's test vector.
 proof fn lemma_pcg32_test_vector()
     ensures
         pcg32_bytes(0, 2) == crate::trusted::u64_le_bytes(5029875928683246316u64),

@@ -6,18 +6,20 @@
 //!
 //! This file has two parts.
 //!
-//! **Specifications of standard-library items** (S1-S6). The verified code calls these items, but
-//! vstd does not specify them. Verus takes each specification on trust; each one states what the
-//! standard library documents for the item, and none of them contains code.
+//! **Specifications of standard-library items** (S1, S3, S4). The verified code calls these items,
+//! but vstd does not specify them. Verus takes each specification on trust; each one states what
+//! the standard library documents for the item, and none of them contains code. S2, S5 and S6 were
+//! here until Verus 0.2026.11.22, whose vstd provides them with the same contracts (so they are
+//! still trusted, as part of vstd).
 //!
 //! | id | items | specification |
 //! |----|-------|---------------|
 //! | S1 | trait `core::error::Error` | its supertraits (`Debug + Display`), so that `TryRng::Error` may be bounded by it |
-//! | S2 | trait `core::ops::DerefMut` | `deref_mut` exists; no contract |
+//! | S2 | trait `core::ops::DerefMut` | (now in vstd) `deref_mut` exists; no contract |
 //! | S3 | trait `AsRef`; `<[T; N] as AsRef<[T]>>::as_ref` | `as_ref` on an array returns the array's elements as a slice |
 //! | S4 | trait `AsMut`; `<[T; N] as AsMut<[T]>>::as_mut` | no contract in general; on an array, the slice is the array (writes through it are writes to the array) |
-//! | S5 | `<[T]>::copy_from_slice` | requires equal lengths (otherwise it panics); `dst` becomes a copy of `src` |
-//! | S6 | `u32::rotate_right` | rotation right by `n % 32` |
+//! | S5 | `<[T]>::copy_from_slice` | (now in vstd) requires equal lengths (otherwise it panics); `dst` becomes a copy of `src` |
+//! | S6 | `u32::rotate_right` | (now in vstd, `vstd::wrapping::u32_specs::rotate_right`) rotation right by `n % 32` |
 //!
 //! **Code** (C1-C5) that Verus cannot check: upstream code, moved here unchanged except for
 //! visibility, or one upstream expression or statement wrapped in a function. Each function has a
@@ -29,17 +31,17 @@
 //! | C2 | `panic_msg` (from `unwrap_err.rs`) | it panics with a formatted message; Verus supports neither. Its contract, `ensures false`, says that it does not return, which is what `panic!` does. Unchanged except `pub(crate)` |
 //! | C3 | `check_skip`: the `assert!(n < N)` of `BlockRng::reset_and_skip` | Verus does not support panics. Its precondition is the asserted condition, so the assertion never fails in verified code; unverified callers get upstream's check, with the same message and location (`#[track_caller]`) |
 //! | C4 | `check_read_words_len`: the `assert_eq!` of `utils::read_words` | as C3. Its precondition is `src.len() == N * size_of::<W>()`; that this implies upstream's condition `size_of_val(src) == size_of::<[W; N]>()` is the layout of slices and arrays (Rust Reference, "Type layout": `[T; N]` has size `N * size_of::<T>()`), which vstd does not state for arrays |
-//! | C5 | `u32_to_le_bytes`, `u32_from_le_bytes`, `u64_to_le_bytes`, `u64_from_le_bytes`: the standard-library functions, called | their signatures (`[u8; size_of::<Self>()]`) cannot be given an `assume_specification`. Contract: little-endian byte order |
+//! | C5 | `u32_to_le_bytes`, `u32_from_le_bytes`, `u64_to_le_bytes`, `u64_from_le_bytes`: the standard-library functions, called | their signatures (`[u8; size_of::<Self>()]`) could not be given an `assume_specification` when this was written. Contract: little-endian byte order. (vstd 0.2026.11.22 specifies `u32`/`u64::from_le_bytes`, not `to_le_bytes`; the `from` wrappers could move to vstd's specification) |
 
 use crate::Infallible;
 use crate::block::{BlockRng, Generator};
 use core::fmt;
 use vstd::prelude::*;
 
-// ===== S1-S6: specifications of standard-library items =====
+// ===== S1, S3, S4: specifications of standard-library items =====
 
 // Only in Verus builds (like vstd's own `std_specs`): a normal build has no use for
-// specifications, and S2-S4 name the unstable `core::marker::PointeeSized`.
+// specifications, and S3 and S4 name the unstable `core::marker::PointeeSized`.
 #[cfg(verus_keep_ghost)]
 pub mod std_specs {
     use vstd::prelude::*;
@@ -53,14 +55,7 @@ pub mod std_specs {
         type ExternalTraitSpecificationFor: core::error::Error;
     }
 
-    // ===== S2 =====
-
-    #[verifier::external_trait_specification]
-    pub trait ExDerefMut: core::ops::Deref + core::marker::PointeeSized {
-        type ExternalTraitSpecificationFor: core::ops::DerefMut;
-
-        fn deref_mut(&mut self) -> &mut Self::Target;
-    }
+    // S2 (`DerefMut`): provided by vstd since Verus 0.2026.11.22.
 
     // ===== S3 =====
 
@@ -101,31 +96,8 @@ pub mod std_specs {
             final(a)@ == final(r)@,
     ;
 
-    // ===== S5 =====
-
-    pub assume_specification<T: Copy>[ <[T]>::copy_from_slice ](dst: &mut [T], src: &[T])
-        requires
-            old(dst)@.len() == src@.len(),
-        ensures
-            final(dst)@ == src@,
-    ;
-
-    // ===== S6 =====
-
-    /// `x.rotate_right(n)`: the bits of `x` rotated right by `n % 32`.
-    pub open spec fn u32_rotate_right(x: u32, n: u32) -> u32 {
-        let s = n % 32;
-        if s == 0 {
-            x
-        } else {
-            (x >> s) | (x << ((32 - s) as u32))
-        }
-    }
-
-    pub assume_specification[ u32::rotate_right ](x: u32, n: u32) -> (r: u32)
-        ensures
-            r == u32_rotate_right(x, n),
-    ;
+    // S5 (`copy_from_slice`) and S6 (`u32::rotate_right`): provided by vstd since Verus
+    // 0.2026.11.22, with the same contracts.
 
     } // verus!
 }

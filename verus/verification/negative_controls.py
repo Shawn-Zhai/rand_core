@@ -15,7 +15,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CRATE = os.path.dirname(HERE)
 VERUS = os.environ.get('VERUS', shutil.which('verus') or 'verus')
 
-# (id, description, file, old text, new text). `old` must occur exactly once in `file`.
+# (id, description, file, old text, new text). `old` must occur exactly once in `file`. For a
+# mutation at several sites of one file, `old` and `new` are lists of the same length.
 MUTANTS = [
     ('M1', 'next_word: generate only when index > N (reads results[N] when the buffer is empty)',
      'block.rs', '''        let mut index = self.index();
@@ -85,8 +86,12 @@ MUTANTS = [
     ('M20', 'word: u32::from_le_bytes decodes big-endian',
      'word.rs', '''            crate::trusted::u32_from_le_bytes(bytes)''',
      '''            crate::trusted::u32_from_le_bytes([bytes[3], bytes[2], bytes[1], bytes[0]])'''),
-    ('M21', 'TRUSTED spec wrong: rotate_right specified as a rotation left (caught by the PCG32 test vector)',
-     'trusted.rs', '        (x >> s) | (x << ((32 - s) as u32))', '        (x << s) | (x >> ((32 - s) as u32))'),
+    # (Until Verus 0.2026.11.22, M21 mutated this crate's trusted spec of `rotate_right`; vstd now
+    # provides that spec. Here code and spec rotate left consistently, so only the test vector
+    # can tell.)
+    ('M21', 'pcg32 and its spec rotate left instead of right (caught by the PCG32 test vector)',
+     'seedable_rng.rs', ['vstd::wrapping::u32_specs::rotate_right(', 'let x = xorshifted.rotate_right(rot);'],
+     ['vstd::wrapping::u32_specs::rotate_left(', 'let x = xorshifted.rotate_left(rot);']),
     ('M22', 'TRUSTED spec wrong: to_le_bytes specified big-endian (caught by the PCG32 test vector)',
      'trusted.rs', '''pub open spec fn u32_le_bytes(x: u32) -> Seq<u8> {
     seq![
@@ -126,11 +131,15 @@ def main():
         for mid, desc, fname, old, new in MUTANTS:
             path = os.path.join(src, fname)
             orig = open(path).read()
-            if orig.count(old) != 1:
+            olds, news = (old, new) if isinstance(old, list) else ([old], [new])
+            if any(orig.count(o) != 1 for o in olds):
                 print(f'{mid}: mutation site not found exactly once in {fname}')
                 failures += 1
                 continue
-            open(path, 'w').write(orig.replace(old, new))
+            mutated = orig
+            for o, n in zip(olds, news):
+                mutated = mutated.replace(o, n)
+            open(path, 'w').write(mutated)
             ok, summary, out = verify(src)
             open(path, 'w').write(orig)
             if ok:
