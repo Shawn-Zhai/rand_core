@@ -1,0 +1,189 @@
+Specification diff (spec_diff.py): requires/ensures clauses and the spec functions they use. Line numbers are those of the source files;
+each hunk header ends with the signature of its function.
+
+--- verus/src/block.rs
++++ verus_fixed/src/block.rs
+@@ -0,0 +96,3 @@ pub open spec fn index_is<W: Word>(x: W, i: int) -> bool {
++pub open spec fn index_is<W: Word>(x: W, i: int) -> bool {
++    W::try_from_spec(i as usize) === Ok(x)
++}
+@@ -167,6 +188,14 @@ pub fn reconstruct(core: G, remaining_results: &[W]) -> (r: Option<Self>)
+         requires
+-            0 < N <= W::spec_max(),
++            remaining_results@.len() < N ==> W::try_from_spec(N).is_ok(),
+         ensures
+             remaining_results@.len() < N ==> (r matches Some(rng) && rng.wf() && rng.buffer()
+                 == remaining_results@ && rng.spec_core() == core),
+             remaining_results@.len() >= N ==> r is None,
++            (r is None) <==> remaining_results@.len() >= N,
++            match r {
++                Some(rng) => rng.spec_core() === core,
++                None => true,
++            },
+@@ -0,0 +248,3 @@ pub closed spec fn spec_results(&self) -> G::Output {
++    pub closed spec fn spec_results(&self) -> G::Output {
++        self.results
++    }
+@@ -263,4 +343,5 @@ fn index(&self) -> (r: usize)
+         requires
+-            self.wf(),
++            0 < N,
++            self.spec_index() <= N,
+         ensures
+             r == self.spec_index(),
+@@ -296,5 +377,7 @@ pub fn reset_and_skip(&mut self, n: usize)
+         requires
+-            old(self).wf(),
++            N > 0,
++            W::try_from_spec(N).is_ok(),
+             n < N,
+         ensures
+             final(self).wf(),
+@@ -303,3 +386,7 @@ pub fn reset_and_skip(&mut self, n: usize)
+             n > 0 ==> exists|block: [W; N]|
+                 #[trigger] G::generate_post(&old(self).spec_core(), &final(self).spec_core(), &block)
+                     && final(self).buffer() == block@.subrange(n as int, N as int),
++            n == 0 ==> final(self).spec_core() === old(self).spec_core(),
++            n == 0 ==> forall|i: int|
++                1 <= i < N as int ==> final(self).spec_results()@[i] == old(self).spec_results()@[i],
+@@ -328,5 +415,11 @@ pub fn word_offset(&self) -> (r: usize)
+         requires
+-            self.wf(),
++            self.wf() || (N > 0 && exists|i: int|
++                1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                    self.spec_results()@[0],
++                )),
+         ensures
+             r == if self.buffer().len() == 0 {
+                 0
+@@ -352,5 +446,12 @@ pub fn remaining_results(&self) -> (r: &[W])
+         requires
+-            self.wf(),
++            self.wf() || (N > 0 && exists|i: int|
++                1 <= i <= N as int && #[trigger] W::try_from_spec(i as usize) === Ok(
++                    self.spec_results()@[0],
++                )),
+         ensures
+             r@ == self.buffer(),
+             r@.len() < N,
+@@ -367,3 +469,24 @@ pub fn next_word(&mut self) -> (r: W)
+         ensures
+             final(self).wf(),
+             old(self).consumes(final(self), 1, seq![r]),
++            forall|i: int|
++                0 <= i < N as int && #[trigger] index_is(old(self).spec_results()@[0], i) ==> {
++                    &&& r == old(self).spec_results()@[i]
++                    &&& final(self).spec_core() === old(self).spec_core()
++                    &&& index_is(final(self).spec_results()@[0], i + 1)
++                    &&& forall|j: int|
++                        1 <= j < N as int ==> final(self).spec_results()@[j] == old(
++                            self,
++                        ).spec_results()@[j]
++                },
++            index_is(old(self).spec_results()@[0], N as int) ==> index_is(
++                final(self).spec_results()@[0],
++                1,
++            ),
+@@ -406,3 +544,27 @@ pub fn next_u64_from_u32(&mut self) -> (r: u64)
+             exists|words: Seq<u32>|
+                 #[trigger] old(self).consumes(final(self), 2, words) && r == ((words[1] as u64)
+                     << 32u64) | (words[0] as u64),
++            (old(self).spec_results()@[0] as usize) < N - 1 ==> r
++                == ((old(self).spec_results()@[(old(self).spec_results()@[0] as int) + 1] as u64)
++                << 32) | (old(self).spec_results()@[old(self).spec_results()@[0] as int] as u64),
++            (old(self).spec_results()@[0] as usize) < N - 1 ==> forall|i: int|
++                1 <= i < N as int ==> final(self).spec_results()@[i] == old(self).spec_results()@[i],
++            (old(self).spec_results()@[0] as usize) < N - 1
++                ==> final(self).spec_core() === old(self).spec_core(),
++            (old(self).spec_results()@[0] as usize) < N - 1
++                ==> final(self).spec_results()@[0] == old(self).spec_results()@[0] + 2,
++            (old(self).spec_results()@[0] as usize) == N - 1
++                ==> (r & 0xFFFF_FFFFu64) == old(self).spec_results()@[N as int - 1] as u64,
++            (old(self).spec_results()@[0] as usize) == N - 1
++                ==> final(self).spec_results()@[0] == 1u32,
++            (old(self).spec_results()@[0] as usize) >= N
++                ==> (r >> 32) == final(self).spec_results()@[1] as u64,
++            (old(self).spec_results()@[0] as usize) >= N
++                ==> final(self).spec_results()@[0] == 2u32,
+@@ -463,3 +630,43 @@ pub fn fill_bytes(&mut self, dest: &mut [u8])
+                     &&& k * size_of::<W>() >= old(dest)@.len()
+                     &&& (k == 0 || (k - 1) * size_of::<W>() < old(dest)@.len())
+                 },
++            old(dest)@.len() == 0 ==> *final(self) === *old(self),
++            exists|i: int|
++                1 <= i <= N as int && #[trigger] index_is(final(self).spec_results()@[0], i),
++            forall|i: int|
++                1 <= i <= N as int && #[trigger] index_is(old(self).spec_results()@[0], i)
++                    && old(dest)@.len() as int <= (N as int - i) * (
++                vstd::layout::size_of::<W>() as int) ==> {
++                    &&& final(self).spec_core() === old(self).spec_core()
++                    &&& forall|j: int|
++                        1 <= j < N as int ==> final(self).spec_results()@[j] == old(
++                            self,
++                        ).spec_results()@[j]
++                    &&& index_is(
++                        final(self).spec_results()@[0],
++                        i + (old(dest)@.len() as int + vstd::layout::size_of::<W>() as int - 1) / (
++                        vstd::layout::size_of::<W>() as int),
++                    )
++                },
++            forall|i: int|
++                1 <= i <= N as int && #[trigger] index_is(old(self).spec_results()@[0], i)
++                    && old(dest)@.len() as int > (N as int - i) * (
++                vstd::layout::size_of::<W>() as int) ==> {
++                    let size = vstd::layout::size_of::<W>() as int;
++                    let remaining = (N as int - i) * size;
++                    let extra = old(dest)@.len() as int - remaining;
++                    let words = (extra + size - 1) / size;
++                    let new_index = ((words - 1) % N as int) + 1;
++                    index_is(final(self).spec_results()@[0], new_index)
++                },
+--- verus/src/lib.rs
++++ verus_fixed/src/lib.rs
+@@ -99,3 +99,5 @@ fn fill_bytes(&mut self, dst: &mut [u8])
+                     final(dst)@,
+                     res,
+                 ),
++            final(dst)@.len() == old(dst)@.len(),
+@@ -265,2 +267,4 @@ fn try_fill_bytes(&mut self, dst: &mut [u8]) -> (res: Result<(), Self::Error>)
+         ensures
+             Self::try_fill_bytes_post(old(self), final(self), old(dst)@, final(dst)@, res),
++            final(dst)@.len() == old(dst)@.len(),
+--- verus/src/unwrap_err.rs
++++ verus_fixed/src/unwrap_err.rs
+@@ -0,0 +92,5 @@ pub fn re<'b>(&'b mut self) -> (result: UnwrapErr<&'b mut R>)
++        ensures
++            &*result.0 === &*old(self).0,
++            &*final(result.0) === &*final(self).0,
+--- verus/src/utils.rs
++++ verus_fixed/src/utils.rs
+@@ -234,3 +234,6 @@ pub fn fill_bytes_via_next_word<E, W: Word>(
+                 },
+             Err(e) => next_word.ensures((), Err(e)),
+         },
++        old(dst)@.len() == 0 ==> res.is_ok(),
++        old(dst)@.len() == 0 ==> final(dst)@ === old(dst)@,
+@@ -347,3 +350,14 @@ pub fn read_words<W: Word, const N: usize>(src: &[u8]) -> (r: [W; N])
+         src@.len() == N * size_of::<W>(),
+     ensures
+         le_bytes_of_words(r@) == src@,
++        r@.len() == N,
++        forall|i: int|
++            0 <= i < N as int ==> r@[i] == W::spec_from_le_bytes(
++                src@.subrange(
++                    i * vstd::layout::size_of::<W>() as int,
++                    (i + 1) * vstd::layout::size_of::<W>() as int,
++                ),
++            ),
+--- verus/src/word.rs
++++ verus_fixed/src/word.rs
+@@ -0,0 +10,1 @@ spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self;
++    spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self;
+@@ -0,0 +33,3 @@ open spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self {
++    open spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self {
++        vstd::bytes::spec_u32_from_le_bytes(bytes)
++    }
+@@ -0,0 +56,3 @@ open spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self {
++    open spec fn spec_from_le_bytes(bytes: Seq<u8>) -> Self {
++        vstd::bytes::spec_u64_from_le_bytes(bytes)
++    }
